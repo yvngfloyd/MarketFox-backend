@@ -46,7 +46,7 @@ PROMPT_COMPARE = (
 )
 
 # Модель Groq (можешь сменить на llama3-70b-8192, если хочешь мощнее)
-GROQ_MODEL = "llama3-8b-8192"
+GROQ_MODEL = "llama-3.1-8b-instant"
 
 
 # ----------------- Клиент Groq -----------------
