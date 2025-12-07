@@ -1,209 +1,269 @@
 import os
 import logging
-from typing import Any, Dict, List
+import re
+from typing import Any, Dict, Optional
 
-import httpx
 from fastapi import FastAPI
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from groq import Groq
 
-# ---------------------- ЛОГИ ---------------------- #
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+# -------------------------------------------------
+#  ЛОГИ
+# -------------------------------------------------
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("marketfox")
 
-# ---------------------- НАСТРОЙКИ ---------------------- #
-
+# -------------------------------------------------
+#  НАСТРОЙКА ИИ (GROQ)
+# -------------------------------------------------
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.1-8b-instant"
-
 if not GROQ_API_KEY:
-    logger.warning("GROQ_API_KEY is not set. Groq calls will fail.")
+    logger.warning("GROQ_API_KEY is not set. API calls will fail.")
+client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-# --------- СИСТЕМНЫЕ ПРОМПТЫ ДЛЯ РАЗНЫХ СЦЕНАРИЕВ ---------- #
-
-SYSTEM_PROMPT_PRODUCT_PICK = """
-Ты MarketFox — персональный ассистент по подбору товаров на маркетплейсах.
-Всегда отвечай по-русски. Пользователь описывает, что хочет купить.
-
-Твоя задача:
-1) Кратко понять запрос и сформулировать, что он ищет (1 предложение).
-2) Дать до 5 ключевых критериев выбора именно для этой категории.
-3) Предложить 3–5 примерных вариантов/типов товаров или моделей (бренды не обязательны).
-4) Пиши обычным текстом: абзацы и списки через тире. Без Markdown, без нумерации "1)", без звёздочек и эмодзи.
-5) Не выдумывай конкретные цены. Если упоминаешь бюджет — говори ориентировочно: "до 5 тысяч", "в районе 10–15 тысяч" и т.п.
-"""
-
-SYSTEM_PROMPT_GIFT = """
-Ты MarketFox — ассистент по подбору подарков.
-Всегда отвечай по-русски.
-
-Пользователь описывает, кому нужен подарок и на какую сумму.
-Твоя задача:
-1) Кратко описать, кому и на какой повод подбираем подарок.
-2) Предложить 3–7 конкретных идей категорий подарков (типы товаров, впечатления и т.п.).
-3) Для каждой идеи коротко поясни, чем она может понравиться получателю.
-4) Пиши обычным текстом, без Markdown и эмодзи.
-"""
-
-SYSTEM_PROMPT_COMPARE = """
-Ты MarketFox — ассистент по сравнению товаров.
-
-Пользователь присылает 2 товара (названия или модели) и хочет понять, что лучше взять.
-Твоя задача:
-1) Кратко пересказать, какие два варианта сравниваем.
-2) Сравнить их по 3–6 ключевым параметрам (качество, автономность, удобство, цена и т.д.).
-3) В конце дать чёткий вывод: что ты рекомендуешь и почему, с учётом типичного пользователя.
-4) Пиши обычным текстом: блоками и списками через тире. Без Markdown, без "1)", без эмодзи.
-"""
-
-FALLBACK_TEXT = (
-    "Сейчас не получается обратиться к нейросети. "
-    "Попробуй повторить запрос чуть позже или переформулировать его."
+# -------------------------------------------------
+#  FASTAPI
+# -------------------------------------------------
+app = FastAPI(
+    title="MarketFox API (Groq, Railway)",
+    version="0.5.0",
+    description="Backend для бота MarketFox (подбор товара, подарок, сравнение)",
 )
 
-NO_QUERY_TEXT = (
-    "Нет запроса. Напиши, что именно тебе нужно: тип товара, примерный бюджет "
-    "и важные характеристики."
-)
-
-# ---------------------- Pydantic-модели ---------------------- #
-
-
-class MarketFoxResponse(BaseModel):
-    reply_text: str
-    scenario: str
-
-
-# ---------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---------------------- #
-
-
-def extract_query(payload: Dict[str, Any]) -> str:
+# -------------------------------------------------
+#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# -------------------------------------------------
+def clean_text(text: str) -> str:
     """
-    Забираем текст запроса из разных возможных полей BotHelp.
-    Смотрим по очереди несколько ключей и берём первый непустой.
+    Чистим ответ от markdown/лишних символов:
+    - убираем **жирный**
+    - убираем буллеты *, -, • в начале строк
+    - сжимаем лишние пустые строки
     """
-    candidates: List[str] = []
+    if not text:
+        return text
 
-    for key in ("query", "Запрос", "message", "text", "last_message"):
-        value = payload.get(key)
-        if isinstance(value, str):
-            candidates.append(value.strip())
+    # убираем **жирный**
+    text = text.replace("**", "")
 
-    for v in candidates:
-        if v:
-            return v
+    # убираем буллеты в начале строк
+    text = re.sub(r"^[\-\*•]+\s*", "", text, flags=re.MULTILINE)
 
-    return ""
+    # сжимаем >2 переносов подряд до 2
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text.strip()
+
+
+def build_system_prompt(scenario: str) -> str:
+    """
+    Возвращаем системный промт под конкретный сценарий.
+    Все промты:
+    - только русский
+    - без markdown
+    - дружелюбный, но по делу
+    """
+
+    base = (
+        "Ты MarketFox — персональный ассистент по выбору товаров "
+        "на маркетплейсах (Wildberries, Ozon и похожие).\n"
+        "Отвечай ТОЛЬКО на русском языке, коротко и по делу.\n"
+        "Не используй Markdown-разметку: никаких звездочек, **жирного**, буллетов.\n"
+        "Если нужно перечисление, пиши в формате '1) ... 2) ... 3) ...'.\n"
+        "Избегай воды и общих фраз, говори как умный друг, который разбирается в товарах.\n"
+        "Максимум 8–10 предложений."
+    )
+
+    if scenario == "gift":
+        spec = (
+            "\n\nСЦЕНАРИЙ: пользователю нужен ПОДАРОК.\n"
+            "1) Кратко сформулируй, кому и по какому поводу подарок (если это понятно из запроса).\n"
+            "2) Предложи 3–5 конкретных идей подарков, учитывая бюджет и интересы.\n"
+            "3) Укажи плюсы каждой идеи и в каких случаях она особенно хорошо зайдет.\n"
+            "4) Если информации мало (запрос очень общий), сначала задай 2–3 уточняющих вопроса, "
+            "а уже потом предложи варианты."
+        )
+    elif scenario == "compare":
+        spec = (
+            "\n\nСЦЕНАРИЙ: сравнение ДВУХ ТОВАРОВ.\n"
+            "Пользователь присылает 2 модели или 2 товара.\n"
+            "1) Сначала кратко напомни, какие два товара сравниваем.\n"
+            "2) Затем сравни по 3–5 ключевым аспектам (качество, удобство, надежность, цена и т.п.).\n"
+            "3) В конце дай четкий вывод: какой товар лучше выбрать и почему.\n"
+            "Если пользователь прислал что-то одно или непонятный текст — попроси корректно прислать "
+            "2 названия или 2 ссылки."
+        )
+    else:
+        # по умолчанию — подбор товара
+        spec = (
+            "\n\nСЦЕНАРИЙ: подбор ЛУЧШЕГО ТОВАРА под запрос пользователя.\n"
+            "1) Понять, что именно человек хочет купить, под какой бюджет и зачем.\n"
+            "2) Если запрос слишком короткий и непонятный (одно-два слова без контекста), "
+            "задай 2–3 уточняющих вопроса вместо рекомендаций.\n"
+            "3) Если информации достаточно, дай:\n"
+            "   3–5 главных критериев выбора именно для этого товара;\n"
+            "   3–5 рекомендаций по тому, на что смотреть при выборе (тип, характеристики, нюансы).\n"
+            "4) Если уместно, можешь привести 2–3 примера подходящих решений (без детальной рекламы брендов)."
+        )
+
+    return base + spec
+
+
+def extract_query(payload: Dict[str, Any]) -> Optional[str]:
+    """
+    Извлекаем текст запроса из полезной нагрузки.
+    В BotHelp ты можешь называть поле как хочешь — здесь просто перечисляем варианты.
+    """
+    candidates = [
+        "Запрос",
+        "запрос",
+        "query",
+        "message",
+        "text",
+        "Продукт",
+    ]
+
+    for key in candidates:
+        if key in payload and isinstance(payload[key], str):
+            value = payload[key].strip()
+            if value:
+                return value
+
+    return None
 
 
 def extract_scenario(payload: Dict[str, Any]) -> str:
     """
-    Определяем сценарий, который пришёл из BotHelp.
-    По умолчанию считаем, что это подбор товара.
+    Сценарий нам приходит из BotHelp (product_pick / gift / compare).
+    Если нет — по умолчанию считаем, что это подбор товара.
     """
-    scenario = str(payload.get("scenario") or "").strip().lower()
+    scenario = payload.get("scenario") or payload.get("Сценарий") or payload.get("scenario_name")
+    if not isinstance(scenario, str):
+        return "product_pick"
 
-    if scenario in {"product_pick", "gift", "compare"}:
+    scenario = scenario.strip().lower()
+    if scenario in {"gift", "compare", "product_pick"}:
         return scenario
-
-    # если что-то левое — сводим к product_pick
     return "product_pick"
 
 
-async def call_groq(system_prompt: str, user_query: str) -> str:
+def build_fallback_answer(scenario: str, query: Optional[str]) -> str:
     """
-    Вызов Groq как OpenAI-совместимого API.
+    Ответ, если с ИИ или API что-то пошло не так.
     """
-    if not GROQ_API_KEY:
+    base = "Сейчас я не могу обратиться к нейросети, но вот как можно подойти к выбору:\n"
+
+    if scenario == "gift":
+        return (
+            base
+            + "1) Подумай, чем человек реально увлекается и что ему облегчит жизнь.\n"
+              "2) Сузь бюджет и сразу отсей совсем бесполезные вещи.\n"
+              "3) Выбери 3–5 идей (впечатления, гаджеты, аксессуары, хобби) и спроси себя, "
+              "что ему будет приятно получать и использовать чаще всего."
+        )
+    if scenario == "compare":
+        return (
+            base
+            + "1) Сравни товары по 3–4 ключевым параметрам: надежность, удобство, цена, отзывы.\n"
+              "2) Важно смотреть не только на плюсы, но и на минусы в отзывах.\n"
+              "3) Обычно лучше брать тот товар, у которого меньше критических минусов при схожей цене."
+        )
+
+    # product_pick
+    return (
+        base
+        + "1) Определи бюджет и 1–2 главные характеристики товара.\n"
+          "2) Отсей варианты без отзывов и с очень низким рейтингом.\n"
+          "3) Сравни 3–5 адекватных моделей по ключевым параметрам.\n"
+          "4) Посмотри негативные отзывы — они лучше всего показывают реальные минусы."
+    )
+
+
+def call_groq_sync(system_prompt: str, user_query: str) -> str:
+    """
+    Синхронный вызов Groq Chat Completions.
+    FastAPI сам обернет в поток, тут нам не критична абсолютная асинхронность.
+    """
+    if not client:
         raise RuntimeError("GROQ_API_KEY is not set")
 
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    data = {
-        "model": GROQ_MODEL,
-        "messages": [
+    response = client.chat.completions.create(
+        model="llama-3.1-70b-versatile",
+        messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_query},
         ],
-        "temperature": 0.6,
-        "max_tokens": 700,
-    }
+        max_tokens=500,
+        temperature=0.6,
+    )
+    content = response.choices[0].message.content
+    return content or ""
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(GROQ_URL, headers=headers, json=data)
-        # если ошибка — поднимем исключение, поймаем выше и отдадим фолбэк
-        resp.raise_for_status()
-        payload = resp.json()
+
+def generate_reply(scenario: str, query: Optional[str]) -> str:
+    """
+    Основная логика: строим промт, вызываем Groq, чистим ответ.
+    """
+    logger.info("Generate reply: scenario=%s, query=%s", scenario, query)
+
+    if not query:
+        # Совсем нет текста – объясняем, что нужен запрос
+        if scenario == "gift":
+            return "Пока не вижу запроса. Напиши, кому нужен подарок, по какому поводу и примерный бюджет."
+        if scenario == "compare":
+            return "Пока нет данных для сравнения. Пришли, пожалуйста, два товара: названия или ссылки."
+        return "Пока не вижу запроса. Напиши, что ты хочешь купить и на какой бюджет."
 
     try:
-        content = payload["choices"][0]["message"]["content"]
-    except Exception as e:  # noqa: BLE001
-        logger.exception("Unexpected Groq response format: %s", e)
-        raise RuntimeError("Bad Groq response")
+        system_prompt = build_system_prompt(scenario)
+        raw_answer = call_groq_sync(system_prompt, query)
+        cleaned = clean_text(raw_answer)
 
-    # немного подчистим лишние переводы строк
-    text = str(content).strip()
-    while "\n\n\n" in text:
-        text = text.replace("\n\n\n", "\n\n")
+        # на всякий случай ограничим длину
+        if len(cleaned) > 2000:
+            cleaned = cleaned[:2000].rsplit(" ", 1)[0] + "..."
 
-    return text
+        return cleaned or build_fallback_answer(scenario, query)
+
+    except Exception as e:
+        logger.exception("Groq API error: %s", e)
+        return build_fallback_answer(scenario, query)
 
 
-async def generate_reply(payload: Dict[str, Any]) -> MarketFoxResponse:
+# -------------------------------------------------
+#  ЭНДПОИНТЫ
+# -------------------------------------------------
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "MarketFox backend is running"}
+
+
+@app.post("/marketfox")
+async def marketfox_endpoint(payload: Dict[str, Any]):
     """
-    Основная логика: выбираем сценарий, вытаскиваем текст запроса,
-    вызываем Groq и формируем ответ.
+    Главный вебхук для BotHelp.
+
+    Ожидаем любой JSON, например:
+    {
+      "scenario": "product_pick",
+      "Запрос": "беспроводные наушники до 3000"
+    }
+
+    Ответ:
+    {
+      "reply_text": "...текст для пользователя...",
+      "scenario": "product_pick"
+    }
     """
     logger.info("Incoming payload keys: %s", list(payload.keys()))
 
     scenario = extract_scenario(payload)
     query = extract_query(payload)
+    reply_text = generate_reply(scenario, query)
 
-    logger.info("Scenario=%s, query=%r", scenario, query)
-
-    if not query:
-        # Пользователь нажал кнопку, но ещё ничего не написал
-        return MarketFoxResponse(reply_text=NO_QUERY_TEXT, scenario=scenario)
-
-    if scenario == "gift":
-        system_prompt = SYSTEM_PROMPT_GIFT
-    elif scenario == "compare":
-        system_prompt = SYSTEM_PROMPT_COMPARE
-    else:
-        system_prompt = SYSTEM_PROMPT_PRODUCT_PICK
-
-    try:
-        answer = await call_groq(system_prompt, query)
-        return MarketFoxResponse(reply_text=answer, scenario=scenario)
-    except Exception as e:  # noqa: BLE001
-        logger.exception("Groq API error: %s", e)
-        return MarketFoxResponse(reply_text=FALLBACK_TEXT, scenario=scenario)
-
-
-# ---------------------- FastAPI-приложение ---------------------- #
-
-app = FastAPI(
-    title="MarketFox API (Groq, Railway)",
-    version="0.2.0",
-    description="Backend для бота MarketFox (подбор товара / подарок / сравнение).",
-)
-
-
-@app.get("/")
-async def root():
-    return {"status": "ok", "message": "MarketFox backend is running"}
-
-
-@app.post("/marketfox", response_model=MarketFoxResponse)
-async def marketfox_endpoint(payload: Dict[str, Any]):
-    """
-    Основная точка входа для BotHelp.
-    """
-    return await generate_reply(payload)
+    return JSONResponse(
+        content={
+            "reply_text": reply_text,
+            "scenario": scenario,
+        }
+    )
