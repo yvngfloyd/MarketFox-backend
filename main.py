@@ -4,6 +4,8 @@ from typing import Any, Dict
 
 from fastapi import FastAPI, Body
 from groq import Groq
+import httpx
+from urllib.parse import quote_plus
 
 # ----------------- Логгер -----------------
 logger = logging.getLogger("marketfox")
@@ -141,7 +143,7 @@ PROMPT_COMPARE = """
 - не пиши длинные полотна текста без пустых строк — дели ответ на аккуратные блоки.
 """
 
-# Модель Groq (можешь сменить на llama3-70b-8192, если хочешь мощнее)
+# Модель Groq
 GROQ_MODEL = "llama-3.1-8b-instant"
 
 
@@ -155,6 +157,68 @@ if GROQ_API_KEY:
         logger.exception("Не удалось инициализировать Groq client")
 else:
     logger.warning("GROQ_API_KEY не задан — будет всегда использоваться fallback")
+
+
+# ----------------- Интеграция с маркетплейсами -----------------
+async def search_wildberries(query: str, limit: int = 5) -> list[dict]:
+    """
+    Ищем товары на Wildberries по тексту запроса.
+    Используем публичный JSON-эндпойнт поиска.
+    """
+    url = "https://search.wb.ru/exactmatch/ru/common/v4/search"
+
+    params = {
+        "query": query,
+        "resultset": "catalog",
+        "page": 1,
+        "sort": "popular",
+        "appType": 1,
+        "curr": "rub",
+        "dest": -1257786,
+        "spp": 30,
+        "lang": "ru",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=5) as client_http:
+            resp = await client_http.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        logger.exception("WB search failed: %s", e)
+        return []
+
+    products = []
+    for p in data.get("data", {}).get("products", [])[:limit]:
+        product_id = p.get("id")
+        if not product_id:
+            continue
+
+        raw_price = p.get("salePriceU") or p.get("priceU")
+        price = raw_price / 100 if isinstance(raw_price, (int, float)) else None
+
+        products.append(
+            {
+                "marketplace": "wildberries",
+                "id": product_id,
+                "name": p.get("name"),
+                "brand": p.get("brand"),
+                "price": price,
+                "rating": p.get("rating"),
+                "feedbacks": p.get("feedbacks"),
+                "link": f"https://www.wildberries.ru/catalog/{product_id}/detail.aspx",
+            }
+        )
+
+    return products
+
+
+def make_ozon_search_link(query: str) -> str:
+    """
+    Просто делаем ссылку на поиск по запросу на Ozon.
+    Потом можно будет заменить на реальный парсер.
+    """
+    return "https://www.ozon.ru/search/?text=" + quote_plus(query)
 
 
 async def call_groq(system_prompt: str, user_query: str) -> str:
@@ -186,6 +250,7 @@ async def generate_reply(system_prompt: str, query: str, scenario: str) -> Dict[
     """
     Общая логика генерации ответа: сначала проверяем запрос, потом пробуем Groq,
     при ошибке падаем в fallback.
+    Добавлено: для product_pick подмешиваем реальные данные с WB + ссылку Ozon.
     """
     safe_scenario = scenario or "product_pick"
 
@@ -196,11 +261,56 @@ async def generate_reply(system_prompt: str, query: str, scenario: str) -> Dict[
             "scenario": safe_scenario,
         }
 
+    # --- Подмешиваем Wildberries/Ozon для сценария подбора товара ---
+    enriched_system_prompt = system_prompt
+    if safe_scenario == "product_pick":
+        try:
+            wb_items = await search_wildberries(query)
+            ozon_link = make_ozon_search_link(query)
+
+            marketplace_context = ""
+            if wb_items:
+                lines = []
+                for i, item in enumerate(wb_items, start=1):
+                    price_txt = f"{int(item['price'])} ₽" if item.get("price") else "цена не указана"
+                    rating_txt = f"{item['rating']}/5" if item.get("rating") else "нет рейтинга"
+                    fb_val = item.get("feedbacks")
+                    fb_txt = f"{fb_val} отзывов" if isinstance(fb_val, int) else "нет данных по отзывам"
+
+                    lines.append(
+                        f"{i}) {item['name']} — бренд {item.get('brand') or 'не указан'}, "
+                        f"примерная цена {price_txt}, рейтинг {rating_txt}, {fb_txt}, "
+                        f"ссылка: {item['link']}"
+                    )
+
+                marketplace_context = (
+                    "Ниже список реальных товаров с маркетплейсов по запросу пользователя.\n"
+                    "Используй ИХ как основу для рекомендаций, плюсов/минусов и сравнения.\n\n"
+                    "Wildberries:\n" + "\n".join(lines) + "\n\n"
+                    f"Ozon (ссылка на поиск по тому же запросу): {ozon_link}\n"
+                )
+            else:
+                marketplace_context = (
+                    "Для этого запроса не получилось получить товары с Wildberries.\n"
+                    f"Вот ссылка на поиск по Ozon: {ozon_link}\n"
+                    "Дай советы в общем виде, без привязки к конкретным карточкам."
+                )
+
+            enriched_system_prompt = (
+                system_prompt
+                + "\n\n"
+                + "=== ДАННЫЕ С МАРКЕТПЛЕЙСОВ ===\n"
+                + marketplace_context
+            )
+        except Exception as e:
+            logger.exception("Ошибка при подготовке данных с маркетплейсов: %s", e)
+            enriched_system_prompt = system_prompt
+
     try:
         if client is None:
             raise RuntimeError("Groq client is not available")
 
-        answer = await call_groq(system_prompt, query)
+        answer = await call_groq(enriched_system_prompt, query)
         logger.info("Успешный ответ от Groq для сценария %s", safe_scenario)
         return {
             "reply_text": answer,
