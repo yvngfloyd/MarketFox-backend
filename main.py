@@ -1,10 +1,11 @@
 import os
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, List
+from urllib.parse import quote_plus
 
 from fastapi import FastAPI, Body
 from groq import Groq
-from urllib.parse import quote_plus
+import httpx
 
 # ----------------- Логгер -----------------
 logger = logging.getLogger("marketfox")
@@ -40,9 +41,9 @@ PROMPT_PRODUCT_PICK = """
 - живой, дружелюбный, без канцелярщины;
 - допускается 1–3 уместных эмодзи (например: 🙂 🔍 🎁 💡), не в каждое предложение;
 - без сленга и пошлых шуток, но можно чуть по-дружески.
-- БЕЗ '*', это прям запрещены такие символы. общайся живым простым текстом
+- обязательно без '*'
 
-Формат ответа (строго придерживайся структуры):
+Формат ответа (можешь немного импровизировать иногда и не полностью следовать формату):
 
 1) Короткое обращение + одно предложение, что ты понял из запроса. Можно 1 эмодзи.
    Пример: "Понял тебя, ищем беспроводные наушники до 5000 ₽ для повседневного использования 🔍"
@@ -65,7 +66,7 @@ PROMPT_PRODUCT_PICK = """
 Запреты:
 - не используй Markdown-разметку (никаких **звёздочек**, #заголовков и буллетов со звёздочками);
 - не придумывай точные характеристики и цены, если их нет в запросе;
-- если информации сильно мало — сначала задай 1–2 уточняющих вопроса, а уже потом давай советы.
+- не придумывай и не пиши никакие URL-ссылки на товары и магазины — ссылки добавит система после тебя.
 """
 
 PROMPT_GIFT = """
@@ -159,7 +160,7 @@ else:
     logger.warning("GROQ_API_KEY не задан — будет всегда использоваться fallback")
 
 
-# ----------------- Вспомогательное: ссылки маркетплейсов -----------------
+# ----------------- Вспомогательные вещи -----------------
 def build_marketplace_links(query: str) -> str:
     """
     Строим безопасные поисковые ссылки на WB и Ozon по исходному запросу.
@@ -180,6 +181,100 @@ def build_marketplace_links(query: str) -> str:
         f"- Ozon: {ozon_url}"
     )
     return links_block
+
+
+async def search_wildberries_simple(query: str, limit: int = 3) -> List[Dict[str, Any]]:
+    """
+    Очень простой поиск по Wildberries: забираем несколько популярных товаров
+    по запросу и возвращаем name/price/url.
+
+    Важно: вызываем не чаще, чем нужно, чтобы не ловить 429.
+    """
+    q = query.strip()
+    if not q:
+        return []
+
+    params = {
+        "query": q,
+        "resultset": "catalog",
+        "page": 1,
+        "sort": "popular",
+        "appType": 1,
+        "curr": "rub",
+        "dest": "-1257786",
+        "spp": 30,
+        "lang": "ru",
+    }
+    url = "https://search.wb.ru/exactmatch/ru/common/v4/search"
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as http_client:
+            resp = await http_client.get(
+                url,
+                params=params,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "MarketFoxBot/1.0",
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.HTTPStatusError as e:
+        # Если поймали 429 или другой код — просто логируем и молча не добавляем товары
+        logger.error("WB search failed: %s", e)
+        return []
+    except Exception as e:
+        logger.error("WB search error: %s", e)
+        return []
+
+    products = (data.get("data") or {}).get("products") or []
+    products = products[:limit]
+
+    results: List[Dict[str, Any]] = []
+    for p in products:
+        pid = p.get("id")
+        name = (p.get("name") or "").strip()
+        price_raw = p.get("salePriceU") or p.get("priceU")
+        price = None
+        if isinstance(price_raw, int):
+            price = price_raw / 100  # на WB цены в копейках
+
+        if not pid or not name:
+            continue
+
+        item_url = f"https://www.wildberries.ru/catalog/{pid}/detail.aspx"
+        results.append(
+            {
+                "name": name,
+                "price": price,
+                "url": item_url,
+            }
+        )
+
+    return results
+
+
+def format_wb_items_block(items: List[Dict[str, Any]]) -> str:
+    """
+    Красиво оформляем блок с товарами WB для текста ответа.
+    """
+    if not items:
+        return ""
+
+    lines = ["\n\nПара примеров товаров на Wildberries, чтобы было от чего оттолкнуться:"]
+    for i, item in enumerate(items, start=1):
+        name = item.get("name") or "Товар"
+        price = item.get("price")
+        url = item.get("url") or ""
+        if price is not None:
+            price_str = f"{int(price):,}".replace(",", " ")
+            lines.append(f"{i}) {name} — примерно {price_str} ₽")
+        else:
+            lines.append(f"{i}) {name}")
+        if url:
+            lines.append(f"   {url}")
+
+    return "\n".join(lines)
 
 
 # ----------------- Вызов Groq -----------------
@@ -230,9 +325,14 @@ async def generate_reply(system_prompt: str, query: str, scenario: str) -> Dict[
         answer = await call_groq(system_prompt, query)
         logger.info("Успешный ответ от Groq для сценария %s", safe_scenario)
 
-        # Для сценария подбора товара добавляем поисковые ссылки WB/Ozon
+        # Для сценария подбора товара добавляем маркетплейсы
         if safe_scenario == "product_pick":
+            # 1) Поисковые ссылки WB + Ozon
             answer += build_marketplace_links(query)
+
+            # 2) Конкретные товары WB
+            wb_items = await search_wildberries_simple(query, limit=3)
+            answer += format_wb_items_block(wb_items)
 
         return {
             "reply_text": answer,
@@ -252,7 +352,7 @@ async def generate_reply(system_prompt: str, query: str, scenario: str) -> Dict[
 app = FastAPI(
     title="MarketFox API (Groq, Railway)",
     description="Backend для MarketFox маркетплейс-ассистента (Groq, Railway)",
-    version="0.6.0",
+    version="0.7.0",
 )
 
 
