@@ -2,8 +2,16 @@ import os
 import logging
 from typing import Any, Dict
 
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body, HTTPException
+from fastapi.responses import FileResponse
 from groq import Groq
+
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from textwrap import wrap
+from uuid import uuid4
 
 # -------------------------------------------------
 # Логгер
@@ -19,8 +27,26 @@ logger.addHandler(handler)
 # -------------------------------------------------
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = "llama-3.1-8b-instant"
+BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 
-# Если Groq упал / не настроен
+# Директория для файлов (PDF)
+FILES_DIR = os.getenv("FILES_DIR", "files")
+os.makedirs(FILES_DIR, exist_ok=True)
+
+# Регистрируем шрифт для кириллицы
+FONT_NAME = "DejaVuSans"
+FONT_PATH = os.path.join("fonts", "DejaVuSans.ttf")
+try:
+    if os.path.exists(FONT_PATH):
+        pdfmetrics.registerFont(TTFont(FONT_NAME, FONT_PATH))
+    else:
+        # если шрифт не нашли — используем стандартный (кириллица может отображаться криво)
+        logger.warning("Файл шрифта %s не найден, кириллица в PDF может отображаться некорректно", FONT_PATH)
+        FONT_NAME = "Helvetica"
+except Exception:
+    logger.exception("Не удалось зарегистрировать шрифт, используем Helvetica по умолчанию")
+    FONT_NAME = "Helvetica"
+
 FALLBACK_TEXT = (
     "Сейчас не могу обратиться к нейросети. "
     "Попробуй сформулировать задачу ещё раз попроще или позже 🦊"
@@ -66,7 +92,7 @@ PROMPT_CLAIM = """
 6) Заключительная часть (подпись, дата — оставить пустыми строками).
 
 Пиши сухим, деловым языком. Не придумывай номера статей, если их нет в данных,
-но можешь ссылаться на общие нормы ГК РФ (например, обязательство исполнить в срок).
+но можешь ссылаться на общие нормы ГК РФ.
 Не используй Markdown.
 """
 
@@ -102,55 +128,93 @@ else:
     logger.warning("GROQ_API_KEY не задан — будет использоваться только fallback")
 
 
-async def call_groq(system_prompt: str, user_query: str) -> str:
+async def get_ai_text(system_prompt: str, user_query: str, scenario: str) -> str:
     """
-    Вызов Groq, возвращает текст ответа или кидает исключение.
+    Вызов Groq, возвращаем только текст (или fallback).
     """
-    if client is None:
-        raise RuntimeError("Groq client is not available")
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_query.strip()},
-    ]
-
-    chat_completion = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=messages,
-        temperature=0.4,
-        max_tokens=1400,
-        top_p=1,
-    )
-
-    content = chat_completion.choices[0].message.content or ""
-    return content.strip()
-
-
-async def generate_reply(system_prompt: str, query: str, scenario: str) -> Dict[str, Any]:
-    """
-    Общая обёртка: пробуем Groq, при ошибке — fallback.
-    """
-    safe_scenario = scenario or "contract"
-
-    if not query or not query.strip():
-        return {
-            "reply_text": "Пока нет данных. Напиши текст/описание, с которым нужно помочь.",
-            "scenario": safe_scenario,
-        }
+    if not user_query or not user_query.strip():
+        return "Пока нет данных. Напиши текст/описание, с которым нужно помочь."
 
     try:
-        answer = await call_groq(system_prompt, query)
-        logger.info("Успешный ответ от Groq для сценария %s", safe_scenario)
-        return {
-            "reply_text": answer,
-            "scenario": safe_scenario,
-        }
+        if client is None:
+            raise RuntimeError("Groq client is not available")
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_query.strip()},
+        ]
+
+        chat_completion = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            temperature=0.4,
+            max_tokens=1400,
+            top_p=1,
+        )
+
+        content = chat_completion.choices[0].message.content or ""
+        return content.strip()
     except Exception as e:
         logger.exception("Groq API error: %s", e)
-        return {
-            "reply_text": FALLBACK_TEXT,
-            "scenario": safe_scenario,
-        }
+        return FALLBACK_TEXT
+
+
+# -------------------------------------------------
+# Генерация PDF
+# -------------------------------------------------
+
+def create_contract_pdf(text: str) -> str:
+    """
+    Делает PDF с текстом договора и возвращает абсолютный путь к файлу.
+    """
+    # уникальное имя файла
+    filename = f"contract_{uuid4().hex}.pdf"
+    filepath = os.path.join(FILES_DIR, filename)
+
+    c = canvas.Canvas(filepath, pagesize=A4)
+    width, height = A4
+
+    # параметры текста
+    left_margin = 40
+    right_margin = 40
+    top_margin = 40
+    bottom_margin = 40
+    line_height = 14
+
+    max_width = width - left_margin - right_margin
+
+    c.setFont(FONT_NAME, 11)
+
+    # простое разбиение текста на строки с переносами
+    y = height - top_margin
+    for paragraph in text.split("\n"):
+        if not paragraph.strip():
+            y -= line_height  # пустая строка
+            continue
+
+        # заворачиваем строку по символам (грубенько, но работает)
+        for line in wrap(paragraph, 100):
+            if y < bottom_margin:
+                c.showPage()
+                c.setFont(FONT_NAME, 11)
+                y = height - top_margin
+            c.drawString(left_margin, y, line)
+            y -= line_height
+
+    c.showPage()
+    c.save()
+
+    return filepath
+
+
+def build_file_url(filename: str) -> str:
+    """
+    Собираем полный URL до файла для отдачи в бот.
+    """
+    if not BASE_URL:
+        # если BASE_URL не задан — просто вернём относительный путь
+        return f"/files/{filename}"
+    return f"{BASE_URL}/files/{filename}"
 
 
 # -------------------------------------------------
@@ -160,7 +224,7 @@ async def generate_reply(system_prompt: str, query: str, scenario: str) -> Dict[
 app = FastAPI(
     title="LegalFox API (Groq, Railway)",
     description="Backend для LegalFox — ИИ-помощника юристам",
-    version="0.2.0",
+    version="0.3.0",
 )
 
 
@@ -168,7 +232,7 @@ app = FastAPI(
 async def legalfox_endpoint(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     """
     Главная точка, куда шлёт запрос BotHelp.
-    Ожидаем поле 'scenario' и дальше — разные поля в зависимости от ветки.
+    Ожидаем поле 'scenario' и разные поля в зависимости от ветки.
     """
     logger.info("Incoming payload keys: %s", list(payload.keys()))
 
@@ -198,6 +262,20 @@ async def legalfox_endpoint(payload: Dict[str, Any] = Body(...)) -> Dict[str, An
 
         system_prompt = PROMPT_CONTRACT
 
+        # Получаем текст договора от ИИ
+        reply_text = await get_ai_text(system_prompt, user_text, scenario)
+
+        # Генерируем PDF
+        pdf_path = create_contract_pdf(reply_text)
+        filename = os.path.basename(pdf_path)
+        file_url = build_file_url(filename)
+
+        return {
+            "reply_text": reply_text,
+            "file_url": file_url,
+            "scenario": "contract",
+        }
+
     # ---------------------------------------------
     # ВЕТКА 2. Претензия / досудебка (claim)
     # ---------------------------------------------
@@ -219,6 +297,12 @@ async def legalfox_endpoint(payload: Dict[str, Any] = Body(...)) -> Dict[str, An
         )
 
         system_prompt = PROMPT_CLAIM
+        reply_text = await get_ai_text(system_prompt, user_text, scenario)
+
+        return {
+            "reply_text": reply_text,
+            "scenario": "claim",
+        }
 
     # ---------------------------------------------
     # ВЕТКА 3. Проверка пункта договора (clause)
@@ -231,30 +315,34 @@ async def legalfox_endpoint(payload: Dict[str, Any] = Body(...)) -> Dict[str, An
         )
         user_text = clause_text
         system_prompt = PROMPT_CLAUSE
+        reply_text = await get_ai_text(system_prompt, user_text, scenario)
+
+        return {
+            "reply_text": reply_text,
+            "scenario": "clause",
+        }
 
     # ---------------------------------------------
     # Fallback / неизвестный сценарий
     # ---------------------------------------------
     else:
         user_text = payload.get("text", "") or ""
-        system_prompt = PROMPT_CONTRACT  # что-то по умолчанию
-        scenario = "contract"
+        reply_text = await get_ai_text(PROMPT_CONTRACT, user_text, "contract")
+        return {
+            "reply_text": reply_text,
+            "scenario": "contract",
+        }
 
-    # Генерируем ответ ИИ
-    result = await generate_reply(system_prompt, user_text, scenario)
 
-    # -------------------------------------------------
-    # ДОБАВЛЯЕМ file_url ДЛЯ СЦЕНАРИЯ ДОГОВОРА
-    # -------------------------------------------------
-    if scenario == "contract":
-        # TODO: заменить на реальный URL уже готового файла (PDF/DOCX),
-        # который ты будешь генерировать и выкладывать куда-то.
-        #
-        # Сейчас — просто тестовый пример. Можно поставить любой
-        # свой файл на Google Drive/Dropbox с прямой ссылкой.
-        result["file_url"] = "https://example.com/test-contract.pdf"
-
-    return result
+@app.get("/files/{filename}")
+async def download_file(filename: str):
+    """
+    Отдаём PDF-файлы по HTTP, чтобы BotHelp мог взять ссылку.
+    """
+    file_path = os.path.join(FILES_DIR, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(file_path, media_type="application/pdf", filename=filename)
 
 
 @app.get("/")
