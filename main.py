@@ -1,11 +1,11 @@
 import os
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, List
+from urllib.parse import quote_plus
 
+import httpx
 from fastapi import FastAPI, Body
 from groq import Groq
-import httpx
-from urllib.parse import quote_plus
 
 # ----------------- Логгер -----------------
 logger = logging.getLogger("marketfox")
@@ -27,7 +27,7 @@ FALLBACK_TEXT = (
     "Попробуй немного уточнить запрос, и я постараюсь помочь более предметно 🐾"
 )
 
-# ВСТАВЬ сюда свои реальные промты
+# ----------------- Промты -----------------
 PROMPT_PRODUCT_PICK = """
 Ты — MarketFox, дружелюбный и умный ассистент по выбору товаров на маркетплейсах (Wildberries, Ozon и т.п.).
 
@@ -56,7 +56,11 @@ PROMPT_PRODUCT_PICK = """
    Не придумывай конкретные артикулы и точные цены, говори диапазонами:
    "до 5000 ₽", "примерно 7–10 тысяч" и т.п.
 
-4) В конце задай один короткий вопрос, чтобы продолжить диалог.
+4) Если в системном промте есть список конкретных товаров с маркетплейсов,
+   ОБЯЗАТЕЛЬНО используй минимум 2–3 из них в блоке "Что можно взять":
+   упомяни название / бренд, кратко плюсы и вставь ссылку отдельной строкой.
+
+5) В конце задай один короткий вопрос, чтобы продолжить диалог.
    Примеры:
    "Хочешь, помогу подобрать конкретные модели?"
    "Если расскажешь, как именно будешь пользоваться, уточню варианты 🙂"
@@ -143,9 +147,8 @@ PROMPT_COMPARE = """
 - не пиши длинные полотна текста без пустых строк — дели ответ на аккуратные блоки.
 """
 
-# Модель Groq
+# ----------------- Модель Groq -----------------
 GROQ_MODEL = "llama-3.1-8b-instant"
-
 
 # ----------------- Клиент Groq -----------------
 client: Groq | None = None
@@ -155,12 +158,25 @@ if GROQ_API_KEY:
         logger.info("Groq client инициализирован")
     except Exception:
         logger.exception("Не удалось инициализировать Groq client")
+        client = None
 else:
     logger.warning("GROQ_API_KEY не задан — будет всегда использоваться fallback")
 
 
-# ----------------- Интеграция с маркетплейсами -----------------
-async def search_wildberries(query: str, limit: int = 5) -> list[dict]:
+# ----------------- Помощники для маркетплейсов -----------------
+def clean_query_for_search(text: str) -> str:
+    """
+    Чуть-чуть чистим запрос от служебных слов, чтобы поиск по маркетплейсу был точнее.
+    Оригинальный текст при этом остаётся для нейросети.
+    """
+    lower = text.lower()
+    for word in ["подбери", "подберите", "подобрать", "найди", "найдите", "нужен", "нужна", "нужно", "ищу"]:
+        lower = lower.replace(word, " ")
+    cleaned = " ".join(lower.split())
+    return cleaned or text
+
+
+async def search_wildberries(query: str, limit: int = 5) -> List[Dict[str, Any]]:
     """
     Ищем товары на Wildberries по тексту запроса.
     Используем публичный JSON-эндпойнт поиска.
@@ -182,13 +198,18 @@ async def search_wildberries(query: str, limit: int = 5) -> list[dict]:
     try:
         async with httpx.AsyncClient(timeout=5) as client_http:
             resp = await client_http.get(url, params=params)
+
+            if resp.status_code == 429:
+                logger.warning("WB вернул 429 Too Many Requests — пропускаем поиск для этого запроса")
+                return []
+
             resp.raise_for_status()
             data = resp.json()
     except Exception as e:
         logger.exception("WB search failed: %s", e)
         return []
 
-    products = []
+    products: List[Dict[str, Any]] = []
     for p in data.get("data", {}).get("products", [])[:limit]:
         product_id = p.get("id")
         if not product_id:
@@ -210,17 +231,69 @@ async def search_wildberries(query: str, limit: int = 5) -> list[dict]:
             }
         )
 
+    logger.info("WB search: найдено %s товаров", len(products))
     return products
 
 
-def make_ozon_search_link(query: str) -> str:
+async def search_ozon(query: str, limit: int = 1) -> List[Dict[str, Any]]:
     """
-    Просто делаем ссылку на поиск по запросу на Ozon.
-    Потом можно будет заменить на реальный парсер.
+    Упрощённый вариант для Ozon: даём пользователю ссылку на поиск по его запросу.
+    Это стабильно и не зависит от внутренних API.
     """
-    return "https://www.ozon.ru/search/?text=" + quote_plus(query)
+    link = f"https://www.ozon.ru/search/?text={quote_plus(query)}"
+    return [
+        {
+            "marketplace": "ozon",
+            "id": None,
+            "name": f"Поиск по запросу «{query}»",
+            "brand": None,
+            "price": None,
+            "rating": None,
+            "feedbacks": None,
+            "link": link,
+        }
+    ]
 
 
+def build_marketplace_context(products: List[Dict[str, Any]]) -> str:
+    """
+    Превращаем список товаров в аккуратный текстовый блок для системного промта.
+    """
+    if not products:
+        return ""
+
+    lines: List[str] = []
+    for p in products:
+        lines.append(f"Источник: {p.get('marketplace')}")
+        name = p.get("name") or "без названия"
+        brand = p.get("brand")
+        if brand:
+            lines.append(f"Товар: {brand} — {name}")
+        else:
+            lines.append(f"Товар: {name}")
+
+        price = p.get("price")
+        if price:
+            lines.append(f"Примерная цена: около {int(price)} ₽")
+
+        rating = p.get("rating")
+        feedbacks = p.get("feedbacks")
+        if rating:
+            if feedbacks:
+                lines.append(f"Рейтинг: {rating} из 5, отзывов: {feedbacks}")
+            else:
+                lines.append(f"Рейтинг: {rating} из 5")
+
+        link = p.get("link")
+        if link:
+            lines.append(f"Ссылка: {link}")
+
+        lines.append("---")
+
+    return "\n".join(lines)
+
+
+# ----------------- Вызов Groq -----------------
 async def call_groq(system_prompt: str, user_query: str) -> str:
     """
     Вызов Groq. Бросает исключение, если что-то пошло не так,
@@ -250,7 +323,6 @@ async def generate_reply(system_prompt: str, query: str, scenario: str) -> Dict[
     """
     Общая логика генерации ответа: сначала проверяем запрос, потом пробуем Groq,
     при ошибке падаем в fallback.
-    Добавлено: для product_pick подмешиваем реальные данные с WB + ссылку Ozon.
     """
     safe_scenario = scenario or "product_pick"
 
@@ -261,56 +333,11 @@ async def generate_reply(system_prompt: str, query: str, scenario: str) -> Dict[
             "scenario": safe_scenario,
         }
 
-    # --- Подмешиваем Wildberries/Ozon для сценария подбора товара ---
-    enriched_system_prompt = system_prompt
-    if safe_scenario == "product_pick":
-        try:
-            wb_items = await search_wildberries(query)
-            ozon_link = make_ozon_search_link(query)
-
-            marketplace_context = ""
-            if wb_items:
-                lines = []
-                for i, item in enumerate(wb_items, start=1):
-                    price_txt = f"{int(item['price'])} ₽" if item.get("price") else "цена не указана"
-                    rating_txt = f"{item['rating']}/5" if item.get("rating") else "нет рейтинга"
-                    fb_val = item.get("feedbacks")
-                    fb_txt = f"{fb_val} отзывов" if isinstance(fb_val, int) else "нет данных по отзывам"
-
-                    lines.append(
-                        f"{i}) {item['name']} — бренд {item.get('brand') or 'не указан'}, "
-                        f"примерная цена {price_txt}, рейтинг {rating_txt}, {fb_txt}, "
-                        f"ссылка: {item['link']}"
-                    )
-
-                marketplace_context = (
-                    "Ниже список реальных товаров с маркетплейсов по запросу пользователя.\n"
-                    "Используй ИХ как основу для рекомендаций, плюсов/минусов и сравнения.\n\n"
-                    "Wildberries:\n" + "\n".join(lines) + "\n\n"
-                    f"Ozon (ссылка на поиск по тому же запросу): {ozon_link}\n"
-                )
-            else:
-                marketplace_context = (
-                    "Для этого запроса не получилось получить товары с Wildberries.\n"
-                    f"Вот ссылка на поиск по Ozon: {ozon_link}\n"
-                    "Дай советы в общем виде, без привязки к конкретным карточкам."
-                )
-
-            enriched_system_prompt = (
-                system_prompt
-                + "\n\n"
-                + "=== ДАННЫЕ С МАРКЕТПЛЕЙСОВ ===\n"
-                + marketplace_context
-            )
-        except Exception as e:
-            logger.exception("Ошибка при подготовке данных с маркетплейсов: %s", e)
-            enriched_system_prompt = system_prompt
-
     try:
         if client is None:
             raise RuntimeError("Groq client is not available")
 
-        answer = await call_groq(enriched_system_prompt, query)
+        answer = await call_groq(system_prompt, query)
         logger.info("Успешный ответ от Groq для сценария %s", safe_scenario)
         return {
             "reply_text": answer,
@@ -319,7 +346,6 @@ async def generate_reply(system_prompt: str, query: str, scenario: str) -> Dict[
 
     except Exception as e:
         logger.exception("Groq API error: %s", e)
-        # Возвращаем аккуратный fallback-ответ
         return {
             "reply_text": FALLBACK_TEXT,
             "scenario": safe_scenario,
@@ -330,7 +356,7 @@ async def generate_reply(system_prompt: str, query: str, scenario: str) -> Dict[
 app = FastAPI(
     title="MarketFox API (Groq, Railway)",
     description="Backend для MarketFox маркетплейс-ассистента (Groq, Railway)",
-    version="0.5.0",
+    version="0.6.0",
 )
 
 
@@ -358,16 +384,42 @@ async def marketfox_endpoint(payload: Dict[str, Any] = Body(...)) -> Dict[str, s
         or "product_pick"
     )
 
-    # Выбираем промт под сценарий
+    logger.info("User scenario=%s query=%s", scenario, query)
+
+    # ----- Обогащение для product_pick -----
     if scenario == "gift":
         system_prompt = PROMPT_GIFT
+
     elif scenario == "compare":
         system_prompt = PROMPT_COMPARE
-    else:
-        system_prompt = PROMPT_PRODUCT_PICK
-        scenario = "product_pick"
 
-    logger.info("User scenario=%s query=%s", scenario, query)
+    else:
+        # по умолчанию — подбор товара
+        scenario = "product_pick"
+        base_prompt = PROMPT_PRODUCT_PICK
+
+        # Ищем товары на маркетплейсах
+        search_query = clean_query_for_search(query)
+        wb_products = await search_wildberries(search_query, limit=5)
+        ozon_items = await search_ozon(search_query, limit=1)
+        all_products = wb_products + ozon_items
+
+        if all_products:
+            marketplace_context = build_marketplace_context(all_products)
+            system_prompt = (
+                base_prompt
+                + "\n\n"
+                + "=== ДАННЫЕ С МАРКЕТПЛЕЙСОВ ===\n"
+                + marketplace_context
+                + "\n\n"
+                + "Если в этом блоке есть конкретные товары с Wildberries/Ozon:\n"
+                  "- ОБЯЗАТЕЛЬНО упоминай минимум 2–3 из них в ответе;\n"
+                  "- по каждому напиши, кому он подойдёт и в чём плюсы;\n"
+                  "- ссылку показывай отдельной строкой, чтобы её можно было нажать.\n"
+                  "Если товаров нет, давай только общие рекомендации без ссылок."
+            )
+        else:
+            system_prompt = base_prompt
 
     result = await generate_reply(system_prompt, query, scenario)
     return result
