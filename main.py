@@ -2,8 +2,8 @@ import os
 import logging
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI
-from openai import OpenAI
+import httpx
+from fastapi import FastAPI, HTTPException
 
 # =========================
 # ЛОГИРОВАНИЕ
@@ -12,23 +12,64 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("marketfox")
 
 # =========================
-# DeepSeek API клиент
+# Groq API
 # =========================
-# DeepSeek использует тот же формат ключа, что и OpenAI,
-# так что кладём его в переменную OPENAI_API_KEY
-DEEPSEEK_API_KEY = os.getenv("OPENAI_API_KEY")
-
-client: Optional[OpenAI]
-if DEEPSEEK_API_KEY:
-    client = OpenAI(
-        api_key=DEEPSEEK_API_KEY,
-        base_url="https://api.deepseek.com",
-    )
-else:
-    client = None
-    logger.warning("OPENAI_API_KEY (DeepSeek) is not set. Using fallback answers.")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.3-70b-versatile"  # мощная универсальная модель
 
 
+async def call_groq(system_prompt: str, user_query: str) -> str:
+    """
+    Вызов Groq Chat Completions API.
+    Если ключ не задан или произошла ошибка — кидаем исключение, а выше дадим фоллбек.
+    """
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is not set")
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_query},
+        ],
+        "temperature": 0.7,
+    }
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.post(GROQ_API_URL, headers=headers, json=payload)
+        try:
+            data = resp.json()
+        except Exception:
+            logger.exception("Groq response is not JSON: %s", resp.text)
+            resp.raise_for_status()
+            raise
+
+        if resp.status_code != 200:
+            logger.error("Groq error %s: %s", resp.status_code, data)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Groq API error {resp.status_code}: {data}",
+            )
+
+        try:
+            return data["choices"][0]["message"]["content"].strip()
+        except Exception:
+            logger.exception("Unexpected Groq response format: %s", data)
+            raise HTTPException(
+                status_code=500,
+                detail="Groq API unexpected response format",
+            )
+
+
+# =========================
+# УТИЛИТЫ
+# =========================
 def extract_query(data: Dict[str, Any]) -> Optional[str]:
     """
     Пытаемся достать текст запроса из разных возможных полей.
@@ -68,18 +109,8 @@ def detect_scenario(text: str) -> str:
 async def generate_reply(query: str, scenario: str) -> str:
     """
     Генерируем ответ от MarketFox.
-    Если нет клиента (нет ключа) или случилась ошибка — отдаём дружелюбный фоллбек.
+    Если Groq недоступен или нет ключа — отдаём дружелюбный фоллбек.
     """
-    if client is None:
-        return (
-            "Я пока не подключён к нейросети, но вот как можно подойти к выбору:\n\n"
-            "1) Определи бюджет и 1–2 главные характеристики товара.\n"
-            "2) Отсей варианты без отзывов и с откровенно странно низкой ценой.\n"
-            "3) Сравни 3–5 адекватных вариантов по самым важным параметрам.\n"
-            "4) Почитай негативные отзывы — они лучше всего показывают реальные минусы.\n\n"
-            "Когда подключим ИИ, я смогу всё это делать за тебя автоматически 🦊"
-        )
-
     base_instructions = (
         "Ты — MarketFox, умный ассистент по выбору товаров на маркетплейсах "
         "(например, Wildberries и Ozon) для русскоязычных пользователей. "
@@ -118,18 +149,9 @@ async def generate_reply(query: str, scenario: str) -> str:
     system_prompt = base_instructions + "\n\n" + scenario_hint
 
     try:
-        response = client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": query},
-            ],
-            temperature=0.7,
-        )
-        reply_text = response.choices[0].message.content.strip()
-        return reply_text
+        return await call_groq(system_prompt, query)
     except Exception as e:
-        logger.exception("DeepSeek API error: %s", e)
+        logger.exception("Groq API error: %s", e)
         return (
             "Сейчас я не могу обратиться к нейросети, но вот базовый алгоритм выбора:\n"
             "1) Сузь бюджет и убери откровенно дешёвые варианты без отзывов.\n"
@@ -139,10 +161,13 @@ async def generate_reply(query: str, scenario: str) -> str:
         )
 
 
+# =========================
+# FASTAPI
+# =========================
 app = FastAPI(
-    title="MarketFox API (DeepSeek, Railway)",
-    description="Backend for MarketFox marketplace assistant (DeepSeek, Railway)",
-    version="0.4.0",
+    title="MarketFox API (Groq, Railway)",
+    description="Backend for MarketFox marketplace assistant (Groq)",
+    version="0.5.0",
 )
 
 
