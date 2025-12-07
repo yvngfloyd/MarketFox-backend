@@ -3,7 +3,6 @@ import logging
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI
-from pydantic import BaseModel
 from openai import OpenAI
 
 # =========================
@@ -15,12 +14,12 @@ logger = logging.getLogger("marketfox")
 # =========================
 # DeepSeek API клиент
 # =========================
-# В Render/OpenAI ENV ты кладёшь сюда свой ключ DeepSeek
+# DeepSeek использует тот же формат ключа, что и OpenAI,
+# так что кладём его в переменную OPENAI_API_KEY
 DEEPSEEK_API_KEY = os.getenv("OPENAI_API_KEY")
 
 client: Optional[OpenAI]
 if DEEPSEEK_API_KEY:
-    # Используем openai-клиент, но шлём запросы в DeepSeek
     client = OpenAI(
         api_key=DEEPSEEK_API_KEY,
         base_url="https://api.deepseek.com",
@@ -30,17 +29,6 @@ else:
     logger.warning("OPENAI_API_KEY (DeepSeek) is not set. Using fallback answers.")
 
 
-# =========================
-# МОДЕЛИ
-# =========================
-class GenericPayload(BaseModel):
-    """Принимаем произвольный JSON от BotHelp."""
-    __root__: Dict[str, Any]
-
-
-# =========================
-# УТИЛИТЫ
-# =========================
 def extract_query(data: Dict[str, Any]) -> Optional[str]:
     """
     Пытаемся достать текст запроса из разных возможных полей.
@@ -83,7 +71,6 @@ async def generate_reply(query: str, scenario: str) -> str:
     Если нет клиента (нет ключа) или случилась ошибка — отдаём дружелюбный фоллбек.
     """
     if client is None:
-        # Фоллбек без ИИ — базовый алгоритм выбора
         return (
             "Я пока не подключён к нейросети, но вот как можно подойти к выбору:\n\n"
             "1) Определи бюджет и 1–2 главные характеристики товара.\n"
@@ -110,16 +97,14 @@ async def generate_reply(query: str, scenario: str) -> str:
             "Сценарий: выбор подарка. Основывайся на запросе пользователя. "
             "Предложи 3–7 идей подарков в разных ценовых диапазонах и стилях. "
             "Объясни, почему каждая идея может подойти. "
-            "Если данных мало (не указан возраст, пол, интересы и т.п.), "
-            "мягко уточни, что ещё можно написать, чтобы подобрать лучше."
+            "Если данных мало, мягко уточни, что ещё можно написать."
         )
     elif scenario == "compare":
         scenario_hint = (
             "Сценарий: сравнение двух или нескольких товаров. "
             "Помоги пользователю понять, по каким критериям сравнивать товары: "
             "качество, функционал, надежность, гарантия, отзывы, бренд, скрытые минусы. "
-            "Дай структурированный чек-лист и подсказки, как принять решение, "
-            "даже если у тебя нет конкретных характеристик моделей."
+            "Дай структурированный чек-лист и подсказки, как принять решение."
         )
     else:
         scenario_hint = (
@@ -154,25 +139,20 @@ async def generate_reply(query: str, scenario: str) -> str:
         )
 
 
-# =========================
-# FASTAPI
-# =========================
 app = FastAPI(
-    title="MarketFox API (DeepSeek)",
-    description="Backend for MarketFox marketplace assistant (powered by DeepSeek)",
-    version="0.2.0",
+    title="MarketFox API (DeepSeek, Railway)",
+    description="Backend for MarketFox marketplace assistant (DeepSeek, Railway)",
+    version="0.4.0",
 )
 
 
 @app.post("/marketfox")
-async def marketfox_endpoint(payload: GenericPayload) -> Dict[str, Any]:
+async def marketfox_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Основной эндпоинт, который будет вызывать BotHelp.
-
-    Ожидаем JSON с произвольными полями, но главное — поле 'Запрос'
-    (или 'query' / 'message' / 'text').
+    Эндпоинт, который будет вызывать BotHelp.
+    Принимаем произвольный JSON (словари с любыми полями).
     """
-    data: Dict[str, Any] = payload.__root__ or {}
+    data: Dict[str, Any] = payload or {}
     logger.info("Incoming payload keys: %s", list(data.keys()))
 
     text_query = extract_query(data)
