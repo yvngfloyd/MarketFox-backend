@@ -1,8 +1,3 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.0
-
-# Groq-клиент
 groq==0.6.0
-
-# ВАЖНО: версия httpx, с которой groq дружит (поддерживает параметр proxies)
-httpx
