@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from fastapi import FastAPI, Body
 from groq import Groq
@@ -16,87 +16,103 @@ logger.addHandler(handler)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = "llama-3.1-8b-instant"
 
-# ----------------- Промты -----------------
+FALLBACK_TEXT = (
+    "Сейчас я временно не могу обратиться к нейросети.\n\n"
+    "Но ты всё равно можешь набросать черновик сам:\n"
+    "1) Чётко опиши стороны и предмет договора/спора.\n"
+    "2) Зафиксируй ключевые сроки и порядок оплаты.\n"
+    "3) Запиши отдельно все риски: штрафы, односторонний отказ, "
+    "одностороннее изменение условий и т.п.\n\n"
+    "Как только нейросеть снова будет доступна, я помогу превратить это в аккуратный текст."
+)
 
+# ----------------- ПРОМПТЫ -----------------
 PROMPT_CONTRACT = """
-Ты — LegalFox, ИИ-помощник юриста. Твоя задача — на основе краткого описания
-сделать ЧЕРНОВИК гражданско-правового договора.
+Ты — LegalFox, ИИ-помощник юриста по подготовке черновиков гражданско-правовых договоров в РФ.
 
-Важные правила:
-- работаешь в праве РФ;
-- это черновик, а не окончательный текст — не пытайся заменить юриста;
-- используй нейтральный деловой стиль, без излишней воды;
-- не выдумывай реквизиты и конкретные суммы, которых нет в описании;
-- не используй Markdown, списки с * и заголовки с # — только обычный текст с абзацами.
+На вход ты получаешь структурированную информацию:
+- тип договора;
+- стороны и краткое описание их ролей;
+- предмет (что передаётся/выполняется);
+- сроки и порядок оплаты;
+- особые условия и риски.
 
-Структура ответа:
-1) Краткий заголовок: какой это договор (например, "ДОГОВОР ПОСТАВКИ").
-2) Блок "Преамбула" — стороны договора (как в классических шаблонах).
-3) Блок "Предмет договора" — что именно передаётся/оказывается.
-4) Блок "Права и обязанности сторон" — 4–8 пунктов по существу.
-5) Блок "Порядок расчётов" и "Срок действия договора".
-6) Блок "Ответственность сторон" и "Прочие условия".
-7) Завершение: "Реквизиты и подписи сторон" (без выдумывания реквизитов).
+Твоя задача — выдать ЧЕРНОВИК договора, который юрист потом доработает.
+Пиши по российскому праву, нейтральным юридическим языком, без излишней воды.
 
-Если исходных данных мало или они противоречивы — добавь короткую ремарку
-в начале: какие моменты юристу нужно будет обязательно проверить/уточнить.
+Формат результата:
+1) Краткое однострочное пояснение, какой договор ты приготовил.
+2) Далее — сам текст договора с нумерованными разделами:
+   1. Предмет договора
+   2. Права и обязанности сторон
+   3. Порядок расчётов
+   4. Срок действия и порядок расторжения
+   5. Ответственность сторон
+   6. Форс-мажор
+   7. Прочие условия
+   8. Реквизиты и подписи сторон
+
+Правила:
+- используй обычный русский текст без Markdown-разметки (**звёздочки**, # и т.п. не нужны);
+- не придумывай заведомо ложные реквизиты (ИНН, ОГРН и т.п.) — там достаточно заглушек типа «___»;
+- если информации по какому-то разделу мало, формулируй его общими, но юридически аккуратными фразами;
+- не давай никаких пояснений после текста договора.
 """
 
 PROMPT_CLAIM = """
-Ты — LegalFox, ИИ-помощник юриста. Твоя задача — составить ЧЕРНОВИК
-досудебной претензии на основе предоставленных данных.
+Ты — LegalFox, ИИ-помощник по подготовке досудебных претензий (претензионный порядок) по праву РФ.
 
-Работаешь в праве РФ.
+На вход ты получаешь:
+- адресата (кому направляем претензию);
+- основание (договор, ситуация, норма закона);
+- суть нарушения и фактические обстоятельства;
+- требования заявителя;
+- желаемый срок исполнения требований;
+- контакты заявителя.
+
+Твоя задача — подготовить аккуратный ЧЕРНОВИК досудебной претензии.
+
+Формат результата:
+1) «шапка» с адресатом и данными заявителя (можно в текстовом виде, без табличной вёрстки);
+2) вводная часть: ссылка на договор/основание и краткое описание отношений сторон;
+3) описательная часть: по пунктам изложи нарушение и обстоятельства (когда, что произошло);
+4) мотивировочная часть: сошлись на общие нормы ГК РФ и, при необходимости, ЗоЗПП (без избыточных цитат);
+5) просительная часть: чёткий перечень требований с указанием срока исполнения;
+6) фраза о том, что при неисполнении требований заявитель оставляет за собой право обратиться в суд;
+7) дата и место для подписи.
 
 Правила:
-- это черновик, не окончательный документ — пиши так, чтобы юрист мог быстро
-  доработать текст;
-- стиль деловой, но понятный, без чрезмерной канцелярщины;
-- не выдумывай суммы, даты и реквизиты, которых нет в описании;
-- не используй Markdown, только обычный текст с абзацами.
-
-Структура ответа:
-1) "Шапка" претензии — кому направляется, от кого (в общих чертах).
-2) Блок "Обстоятельства" — кратко и по порядку описать ситуацию и нарушения.
-3) Блок "Правовое обоснование" — со ссылками на общие нормы (ГК РФ и т.п.),
-   но без глубоких научных комментариев.
-4) Блок "Требования" — перечислить требования заявителя.
-5) Блок "Срок исполнения требований" — указать срок из описания (или разумный).
-6) Заключительная часть: предупреждение о возможном обращении в суд/контролирующие органы.
-7) Место для подписи и контактов отправителя.
-
-Если каких-то данных явно не хватает (суммы, даты, номера договора, реквизиты сторон),
-в тексте поставь пустые места в кавычках или с пометкой "___".
+- пиши деловым, но человеческим языком;
+- не используй Markdown и маркеры со звёздочками;
+- не придумывай конкретный суд, сумму госпошлины и т.п., если их нет во входных данных.
 """
 
-PROMPT_CLAUSE = """
-Ты — LegalFox, ассистент по работе с отдельными пунктами договора.
+PROMPT_CHECKLIST = """
+Ты — LegalFox, ИИ-ассистент, который помогает юристу быстро оценить текст договора или отдельного пункта
+(по праву РФ) и выдать понятный разбор рисков.
 
-Тебе передают:
-- исходный пункт договора;
-- краткое описание договора и сторон;
-- задачу: упростить, усилить, сбалансировать или адаптировать пункт.
+На вход ты получаешь произвольный текст: это может быть пункт договора, блок условий или выдержка из договора.
 
-Твоя задача:
-1) Кратко пояснить (1–2 предложения), что делает исходный пункт и в чём его риск/слабость.
-2) Предложить 1–2 варианта новой редакции пункта:
-   - первый — более "за клиента";
-   - второй — более сбалансированный.
-3) Писать простым юридическим языком РФ без излишней воды.
+Твоя задача — КРАТКО и структурированно ответить:
 
-Не используй Markdown, не пиши огромные полотна текста — работай блоками с абзацами.
+1) Что делает этот пункт / блок условий — 2–3 предложения простым языком.
+2) Риски для клиента (считай, что пользователь — сторона, которая показывает тебе текст):
+   - сделай 3–7 пронумерованных пунктов «1) ... 2) ...»;
+   - выделяй именно практические риски: односторонние права контрагента, штрафы, неясные формулировки, 
+     отсутствие важных оговорок.
+3) Как можно улучшить формулировку:
+   - предложи 1–3 вариантов переформулировки ключевых элементов пункта;
+   - можно давать текст типа «Вместо: “…”, лучше: “…”.»
+4) Какие уточняющие вопросы задать клиенту, чтобы оценить риск точнее
+   (2–4 вопроса, каждый с новой строки).
+
+Правила:
+- не используй Markdown-разметку, только обычный текст с пронумерованными пунктами «1) 2) 3) …»;
+- если текста слишком мало, сначала напиши, что информации недостаточно, и задай несколько уточняющих вопросов;
+- не придумывай конкретные суммы, даты и реквизиты, если их нет в тексте.
 """
 
-FALLBACK_TEXT = (
-    "Сейчас я не могу обратиться к нейросети, но могу подсказать общие шаги:\n\n"
-    "1) Чётко сформулируйте задачу (договор, претензия, редактирование пункта).\n"
-    "2) Соберите факты: стороны, даты, суммы, ключевые условия.\n"
-    "3) Составьте черновик и обязательно покажите его юристу перед использованием.\n\n"
-    "Можете повторить запрос или уточнить детали — я попробую помочь более прицельно."
-)
-
-# ----------------- Groq клиент -----------------
-
+# ----------------- Клиент Groq -----------------
 client: Groq | None = None
 if GROQ_API_KEY:
     try:
@@ -105,12 +121,12 @@ if GROQ_API_KEY:
     except Exception:
         logger.exception("Не удалось инициализировать Groq client")
 else:
-    logger.warning("GROQ_API_KEY не задан — будет использоваться fallback-текст")
+    logger.warning("GROQ_API_KEY не задан — всегда будет использоваться fallback")
 
 
 async def call_groq(system_prompt: str, user_query: str) -> str:
     if not client:
-        raise RuntimeError("Groq client is not available")
+        raise RuntimeError("GROQ client is not available")
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -120,153 +136,127 @@ async def call_groq(system_prompt: str, user_query: str) -> str:
     chat_completion = client.chat.completions.create(
         model=GROQ_MODEL,
         messages=messages,
-        temperature=0.5,
-        max_tokens=900,
+        temperature=0.6,
+        max_tokens=1200,
         top_p=1,
     )
-
     content = chat_completion.choices[0].message.content or ""
     return content.strip()
 
 
-# ----------------- Вспомогательные сборщики -----------------
+async def generate_reply(system_prompt: str, query: str, scenario: str) -> Dict[str, str]:
+    safe_scenario = scenario or "contract"
 
-
-def build_contract_query(payload: Dict[str, Any]) -> str:
-    """
-    Собираем один текст из ответов первой ветки (договор).
-    Поддерживаем и имена без пробелов, и имена с пробелами.
-    """
-    contract_type = payload.get("Тип_договора") or payload.get("Тип договора") or ""
-    parties = payload.get("Стороны") or payload.get("Стороны договора") or ""
-    subject = payload.get("Предмет") or payload.get("Предмет договора") or ""
-    terms = payload.get("Сроки") or payload.get("Сроки и порядок") or ""
-    payment = payload.get("Оплата") or payload.get("Условия оплаты") or ""
-    special = payload.get("Особые_условия") or payload.get("Особые условия") or ""
-
-    parts: List[str] = [
-        f"Тип договора: {contract_type}",
-        f"Стороны и краткое описание: {parties}",
-        f"Предмет договора: {subject}",
-        f"Сроки и порядок исполнения: {terms}",
-        f"Условия оплаты: {payment}",
-    ]
-    if special:
-        parts.append(f"Особые условия и риски: {special}")
-
-    return "\n".join(parts)
-
-
-def build_claim_query(payload: Dict[str, Any]) -> str:
-    """
-    Собираем один текст из ответов второй ветки (претензия).
-    """
-    recipient = payload.get("Адресат") or payload.get("Адресат претензии") or ""
-    grounds = payload.get("Основание") or payload.get("Основание претензии") or ""
-    facts = (
-        payload.get("Нарушение_и_обстоятельства")
-        or payload.get("Нарушение и обстоятельства")
-        or ""
-    )
-    demands = payload.get("Требования") or payload.get("Требования претензии") or ""
-    deadline = payload.get("Срок_исполнения") or payload.get("Сроки исполнения") or ""
-    contacts = payload.get("Контакты") or ""
-
-    parts: List[str] = [
-        f"Адресат (кому направляется претензия): {recipient}",
-        f"Основание претензии (договор, ситуация): {grounds}",
-        f"Нарушение и обстоятельства: {facts}",
-        f"Требования заявителя: {demands}",
-        f"Срок исполнения требований: {deadline}",
-    ]
-    if contacts:
-        parts.append(f"Контакты заявителя: {contacts}")
-
-    return "\n".join(parts)
-
-
-def build_clause_query(payload: Dict[str, Any]) -> str:
-    clause_text = payload.get("Пункт") or payload.get("Текст пункта") or ""
-    context = payload.get("Контекст") or payload.get("Контекст договора") or ""
-    task = payload.get("Задача") or payload.get("Задача_редакции") or ""
-
-    parts: List[str] = [
-        f"Исходный пункт договора: {clause_text}",
-        f"Краткий контекст договора: {context}",
-        f"Задача по редактированию пункта: {task}",
-    ]
-    return "\n".join(parts)
-
-
-# ----------------- Общая генерация -----------------
-
-
-async def generate_reply(payload: Dict[str, Any]) -> Dict[str, str]:
-    """
-    Определяем сценарий и генерируем текст.
-    """
-    # нормализуем scenario
-    raw_scenario = (
-        payload.get("scenario")
-        or payload.get("Сценарий")
-        or payload.get("сценарий")
-        or ""
-    )
-    raw_scenario = str(raw_scenario).strip().lower()
-
-    if raw_scenario == "claim":
-        scenario = "claim"
-    elif raw_scenario == "clause":
-        scenario = "clause"
-    else:
-        scenario = "contract"
-
-    logger.info("Detected scenario=%s", scenario)
-
-    # собираем user_query и выбираем системный промт
-    if scenario == "claim":
-        user_query = build_claim_query(payload)
-        system_prompt = PROMPT_CLAIM
-    elif scenario == "clause":
-        user_query = build_clause_query(payload)
-        system_prompt = PROMPT_CLAUSE
-    else:
-        user_query = build_contract_query(payload)
-        system_prompt = PROMPT_CONTRACT
-        scenario = "contract"
-
-    logger.info("User query for scenario=%s: %s", scenario, user_query)
-
-    if not user_query.strip():
+    if not query or not query.strip():
         return {
-            "reply_text": "Пока не вижу данных для черновика. Попробуй ответить на вопросы бота ещё раз.",
-            "scenario": scenario,
+            "reply_text": "Пока нет данных. Напиши текст/описание, с которым нужно помочь.",
+            "scenario": safe_scenario,
         }
 
     try:
-        if client is None:
-            raise RuntimeError("Groq client is not available")
-        answer = await call_groq(system_prompt, user_query)
-        logger.info("Успешный ответ от Groq для сценария %s", scenario)
-        return {"reply_text": answer, "scenario": scenario}
+        answer = await call_groq(system_prompt, query)
+        logger.info("Успешный ответ от Groq для сценария %s", safe_scenario)
+        return {"reply_text": answer, "scenario": safe_scenario}
     except Exception as e:
         logger.exception("Groq API error: %s", e)
-        return {"reply_text": FALLBACK_TEXT, "scenario": scenario}
+        return {"reply_text": FALLBACK_TEXT, "scenario": safe_scenario}
 
 
 # ----------------- FastAPI -----------------
-
 app = FastAPI(
-    title="LegalFox API",
-    description="Backend для LegalFox — ИИ-помощника юриста",
-    version="0.1.0",
+    title="LegalFox API (Groq, Railway)",
+    description="Backend для LegalFox — ИИ-помощника для юристов",
+    version="0.2.0",
 )
 
 
 @app.post("/legalfox")
 async def legalfox_endpoint(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
     logger.info("Incoming payload keys: %s", list(payload.keys()))
-    result = await generate_reply(payload)
+
+    scenario = (
+        payload.get("scenario")
+        or payload.get("Сценарий")
+        or "contract"
+    )
+
+    # -------- Сценарий 1: договор --------
+    if scenario == "contract":
+        type_ = payload.get("Тип_договора") or payload.get("Тип договора") or ""
+        parties = payload.get("Стороны") or ""
+        subject = payload.get("Предмет") or ""
+        terms = payload.get("Сроки") or ""
+        payment = payload.get("Оплата") or ""
+        special = payload.get("Особые_условия") or payload.get("Особые условия") or ""
+
+        parts = []
+        if type_:
+            parts.append(f"Тип договора: {type_}")
+        if parties:
+            parts.append(f"Стороны и роли: {parties}")
+        if subject:
+            parts.append(f"Предмет: {subject}")
+        if terms:
+            parts.append(f"Сроки: {terms}")
+        if payment:
+            parts.append(f"Порядок оплаты: {payment}")
+        if special:
+            parts.append(f"Особые условия и риски: {special}")
+
+        query = "\n".join(parts).strip()
+        system_prompt = PROMPT_CONTRACT
+
+    # -------- Сценарий 2: претензия --------
+    elif scenario == "claim":
+        adresat = payload.get("Адресат") or ""
+        osn = payload.get("Основание") or ""
+        narush = (
+            payload.get("Нарушение_и_обстоятельства")
+            or payload.get("Нарушение и обстоятельства")
+            or ""
+        )
+        treb = payload.get("Требования") or ""
+        srok = payload.get("Срок_исполнения") or payload.get("Сроки исполнения") or ""
+        contacts = payload.get("Контакты") or ""
+
+        parts = []
+        if adresat:
+            parts.append(f"Адресат: {adresat}")
+        if osn:
+            parts.append(f"Основание: {osn}")
+        if narush:
+            parts.append(f"Нарушение и обстоятельства: {narush}")
+        if treb:
+            parts.append(f"Требования заявителя: {treb}")
+        if srok:
+            parts.append(f"Желаемый срок исполнения: {srok}")
+        if contacts:
+            parts.append(f"Контактные данные заявителя: {contacts}")
+
+        query = "\n".join(parts).strip()
+        system_prompt = PROMPT_CLAIM
+
+    # -------- Сценарий 3: проверка/разбор пункта --------
+    elif scenario == "checklist":
+        text_for_check = (
+            payload.get("Текст")
+            or payload.get("Текст_для_проверки")
+            or payload.get("Текст для проверки")
+            or payload.get("Запрос")
+            or ""
+        )
+        query = text_for_check.strip()
+        system_prompt = PROMPT_CHECKLIST
+
+    # fallback — считаем, что это общий запрос про договор
+    else:
+        raw_query = payload.get("Запрос") or ""
+        query = raw_query.strip()
+        system_prompt = PROMPT_CONTRACT
+        scenario = "contract"
+
+    logger.info("Detected scenario=%s", scenario)
+    result = await generate_reply(system_prompt, query, scenario)
     return result
 
 
