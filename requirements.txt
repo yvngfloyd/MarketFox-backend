@@ -5,4 +5,4 @@ uvicorn[standard]==0.30.0
 groq==0.6.0
 
 # ВАЖНО: версия httpx, с которой groq дружит (поддерживает параметр proxies)
-httpx==0.27.2
+httpx
