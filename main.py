@@ -89,7 +89,7 @@ PROMPT_CONTRACT_UNIVERSAL = """
 4. СТОИМОСТЬ УСЛУГ И ПОРЯДОК РАСЧЁТОВ
 5. ОТВЕТСТВЕННОСТЬ СТОРОН
 6. ФОРС-МАЖОР
-7. СРОК ДЕЙСТВИЯ И ПОРЯДОК РАСТОРЖЕНИЯ
+7. СРОК ДЕЙСТВИЯ И ПОРЯДКА РАСТОРЖЕНИЯ
 8. ПРОЧИЕ УСЛОВИЯ
 9. РЕКВИЗИТЫ И ПОДПИСИ СТОРОН
 
@@ -227,9 +227,9 @@ async def call_groq(system_prompt: str, user_query: str) -> str:
     return content.strip()
 
 
-def create_pdf_from_text(text: str) -> str:
+def create_pdf_from_text(text: str, prefix: str = "contract") -> str:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"contract_{ts}.pdf"
+    filename = f"{prefix}_{ts}.pdf"
     filepath = os.path.join(FILES_DIR, filename)
 
     c = canvas.Canvas(filepath, pagesize=A4)
@@ -313,7 +313,7 @@ async def handle_contract(payload: Dict[str, Any], request: Request) -> Dict[str
 
     try:
         contract_text = await call_groq(PROMPT_CONTRACT_UNIVERSAL, brief)
-        filename = create_pdf_from_text(contract_text)
+        filename = create_pdf_from_text(contract_text, prefix="contract")
 
         base_url = str(request.base_url).rstrip("/")
         file_url = f"{base_url}/files/{filename}"
@@ -339,7 +339,7 @@ async def handle_contract(payload: Dict[str, Any], request: Request) -> Dict[str
         }
 
 
-async def handle_claim(payload: Dict[str, Any]) -> Dict[str, str]:
+async def handle_claim(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
     adresat = get_field(payload, "Адресат")
     basis = get_field(payload, "Основание")
     facts = get_field(payload, "Нарушение_и_обстоятельства", "Нарушение и обстоятельства")
@@ -368,15 +368,22 @@ async def handle_claim(payload: Dict[str, Any]) -> Dict[str, str]:
         }
 
     try:
-        text = await call_groq(PROMPT_CLAIM, query)
+        claim_text = await call_groq(PROMPT_CLAIM, query)
+        filename = create_pdf_from_text(claim_text, prefix="claim")
+
+        base_url = str(request.base_url).rstrip("/")
+        file_url = f"{base_url}/files/{filename}"
+
         reply_text = (
-            text
-            + "\n\nВажно: это примерный черновик претензии. "
-              "Перед отправкой доработай текст и, по возможности, согласуй его с юристом."
+            "Черновик претензии подготовлен. "
+            "Файл можно скачать по ссылке ниже.\n\n"
+            "Важно: это примерный черновик, сформированный ИИ. "
+            "Перед отправкой обязательно проверь текст и, по возможности, согласуй его с юристом."
         )
+
         return {
             "reply_text": reply_text,
-            "file_url": "",
+            "file_url": file_url,
             "scenario": "claim",
         }
     except Exception as e:
@@ -454,7 +461,7 @@ async def handle_qa(payload: Dict[str, Any]) -> Dict[str, str]:
 app = FastAPI(
     title="LegalFox API (Groq, Railway)",
     description="Backend для LegalFox — ИИ-помощника юристам",
-    version="1.1.1",
+    version="1.2.0",
 )
 
 
@@ -517,7 +524,7 @@ async def legalfox_endpoint(
     if scenario == "contract":
         return await handle_contract(payload, request)
     if scenario == "claim":
-        return await handle_claim(payload)
+        return await handle_claim(payload, request)
     if scenario == "clause":
         return await handle_clause(payload)
     if scenario == "qa":
