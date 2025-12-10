@@ -202,9 +202,6 @@ else:
 
 
 def get_field(payload: Dict[str, Any], *keys: str, default: str = "") -> str:
-    """
-    Берём значение по одному из возможных ключей (с пробелами/подчёркиваниями).
-    """
     for key in keys:
         if key in payload and payload[key]:
             return str(payload[key]).strip()
@@ -212,9 +209,6 @@ def get_field(payload: Dict[str, Any], *keys: str, default: str = "") -> str:
 
 
 async def call_groq(system_prompt: str, user_query: str) -> str:
-    """
-    Вызов Groq. Если что-то идёт не так — кидаем исключение.
-    """
     if not client:
         raise RuntimeError("Groq client is not available")
 
@@ -234,10 +228,6 @@ async def call_groq(system_prompt: str, user_query: str) -> str:
 
 
 def create_pdf_from_text(text: str) -> str:
-    """
-    Рендерим многостраничный PDF c кириллицей и нормальными полями.
-    Возвращаем имя файла.
-    """
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"contract_{ts}.pdf"
     filepath = os.path.join(FILES_DIR, filename)
@@ -254,8 +244,8 @@ def create_pdf_from_text(text: str) -> str:
     c.setFont(font_name, 11)
 
     y = top_margin
-
     lines = text.split("\n")
+
     for idx, paragraph in enumerate(lines):
         para = paragraph.rstrip()
 
@@ -267,9 +257,7 @@ def create_pdf_from_text(text: str) -> str:
                 y = top_margin
             continue
 
-        # Если первая строка и содержит слово "ДОГОВОР" — центрируем как заголовок
         is_title = (idx == 0 and "ДОГОВОР" in para.upper())
-
         max_chars = 100
         wrapped = wrap(para, max_chars) or [""]
 
@@ -292,10 +280,6 @@ def create_pdf_from_text(text: str) -> str:
 
 
 async def handle_contract(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
-    """
-    Сценарий: генерация договора + PDF.
-    Используется и с заранее собранными полями, и с одним свободным текстом.
-    """
     raw_type = get_field(payload, "Тип_договора", "Тип договора")
     parties = get_field(payload, "Стороны")
     subject = get_field(payload, "Предмет")
@@ -305,7 +289,6 @@ async def handle_contract(payload: Dict[str, Any], request: Request) -> Dict[str
     special = get_field(payload, "Особые_условия", "Особые условия")
     free_query = get_field(payload, "Запрос", "query", "Query")
 
-    # Собираем бриф для промта
     if any([raw_type, parties, subject, joint_terms, terms, payment, special]):
         brief = (
             f"Тип договора: {raw_type or 'не указан'}\n"
@@ -324,6 +307,7 @@ async def handle_contract(payload: Dict[str, Any], request: Request) -> Dict[str
                 "Пока недостаточно данных для договора. "
                 "Опиши хотя бы тип договора, стороны и предмет."
             ),
+            "file_url": "",
             "scenario": "contract",
         }
 
@@ -350,6 +334,7 @@ async def handle_contract(payload: Dict[str, Any], request: Request) -> Dict[str
         logger.exception("Ошибка при генерации договора: %s", e)
         return {
             "reply_text": FALLBACK_TEXT,
+            "file_url": "",
             "scenario": "contract",
         }
 
@@ -378,6 +363,7 @@ async def handle_claim(payload: Dict[str, Any]) -> Dict[str, str]:
     if not query or not query.strip():
         return {
             "reply_text": "Пока нет данных для претензии. Опиши ситуацию и что именно хочешь потребовать.",
+            "file_url": "",
             "scenario": "claim",
         }
 
@@ -390,12 +376,14 @@ async def handle_claim(payload: Dict[str, Any]) -> Dict[str, str]:
         )
         return {
             "reply_text": reply_text,
+            "file_url": "",
             "scenario": "claim",
         }
     except Exception as e:
         logger.exception("Ошибка Groq в claim: %s", e)
         return {
             "reply_text": FALLBACK_TEXT,
+            "file_url": "",
             "scenario": "claim",
         }
 
@@ -406,6 +394,7 @@ async def handle_clause(payload: Dict[str, Any]) -> Dict[str, str]:
     if not clause_text or not clause_text.strip():
         return {
             "reply_text": "Пришли пункт договора или фрагмент текста, который нужно разобрать.",
+            "file_url": "",
             "scenario": "clause",
         }
 
@@ -418,12 +407,14 @@ async def handle_clause(payload: Dict[str, Any]) -> Dict[str, str]:
         )
         return {
             "reply_text": reply_text,
+            "file_url": "",
             "scenario": "clause",
         }
     except Exception as e:
         logger.exception("Ошибка Groq в clause: %s", e)
         return {
             "reply_text": FALLBACK_TEXT,
+            "file_url": "",
             "scenario": "clause",
         }
 
@@ -434,6 +425,7 @@ async def handle_qa(payload: Dict[str, Any]) -> Dict[str, str]:
     if not question or not question.strip():
         return {
             "reply_text": "Задай вопрос: по договору, претензии, рискам или рабочим процессам юриста.",
+            "file_url": "",
             "scenario": "qa",
         }
 
@@ -446,12 +438,14 @@ async def handle_qa(payload: Dict[str, Any]) -> Dict[str, str]:
         )
         return {
             "reply_text": reply_text,
+            "file_url": "",
             "scenario": "qa",
         }
     except Exception as e:
         logger.exception("Ошибка Groq в qa: %s", e)
         return {
             "reply_text": FALLBACK_TEXT,
+            "file_url": "",
             "scenario": "qa",
         }
 
@@ -460,7 +454,7 @@ async def handle_qa(payload: Dict[str, Any]) -> Dict[str, str]:
 app = FastAPI(
     title="LegalFox API (Groq, Railway)",
     description="Backend для LegalFox — ИИ-помощника юристам",
-    version="1.1.0",
+    version="1.1.1",
 )
 
 
@@ -469,18 +463,10 @@ async def legalfox_endpoint(
     payload: Dict[str, Any] = Body(...),
     request: Request = None,
 ) -> Dict[str, Any]:
-    """
-    ОДНА ТОЧКА ВХОДА ДЛЯ ВСЕХ СЦЕНАРИЕВ.
-
-    В BotHelp можно:
-    - передавать scenario="contract"/"claim"/"clause"/"qa";
-    - или передавать scenario="auto"/не передавать вовсе — тогда сценарий определится по данным.
-    """
     logger.info("Incoming payload keys: %s", list(payload.keys()))
 
     raw_scenario = (payload.get("scenario") or payload.get("Сценарий") or "").strip().lower()
 
-    # Есть ли "претензионные" поля
     has_claim_fields = any(
         k in payload
         for k in [
@@ -495,7 +481,6 @@ async def legalfox_endpoint(
         ]
     )
 
-    # Есть ли "договорные" поля
     has_contract_fields = any(
         k in payload
         for k in [
@@ -511,20 +496,15 @@ async def legalfox_endpoint(
         ]
     )
 
-    # Есть ли поля для разбора пункта
     has_clause_fields = any(k in payload for k in ["Текст", "Фрагмент", "Clause"])
 
     scenario = raw_scenario
 
-    # 1) Если сценарий явно передан и валиден — используем его, но с приоритетом claim по полям
     if scenario in {"contract", "claim", "clause", "qa"}:
-        # Если есть явные поля претензии — насильно переключаемся на claim,
-        # чтобы кнопка "Черновик претензии" никогда не улетала в contract.
         if has_claim_fields and scenario != "claim":
             logger.info("Переназначаю scenario с %s на claim по набору полей", scenario)
             scenario = "claim"
     else:
-        # 2) Если сценарий не задан/левый — определяем автоматически
         if has_claim_fields:
             scenario = "claim"
         elif has_clause_fields:
@@ -534,7 +514,6 @@ async def legalfox_endpoint(
         else:
             scenario = "qa"
 
-    # Роутинг по сценариям
     if scenario == "contract":
         return await handle_contract(payload, request)
     if scenario == "claim":
@@ -547,6 +526,7 @@ async def legalfox_endpoint(
     logger.info("Неизвестный сценарий: %s", scenario)
     return {
         "reply_text": FALLBACK_TEXT,
+        "file_url": "",
         "scenario": scenario,
     }
 
