@@ -22,7 +22,6 @@ logger.addHandler(handler)
 
 # ----------------- КОНФИГ -----------------
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-# Стабильная модель Groq (заменяем старые, которые выпилили)
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
 BASE_DIR = os.path.dirname(__file__)
@@ -77,8 +76,9 @@ PROMPT_CONTRACT_UNIVERSAL = """
 - никаких пояснений, комментариев и обращений к пользователю;
 - выведи ТОЛЬКО чистый текст договора, который можно распечатать и подписать;
 - не используй Markdown и спецразметку (никаких *, #, списков с точками);
+- не используй эмодзи и разговорные выражения;
 - разделы договора нумеруй: 1., 1.1., 2., 2.1. и т.п.;
-- раздел "Реквизиты и подписи сторон" обязателен в конце.
+- в конце обязателен раздел "РЕКВИЗИТЫ И ПОДПИСИ СТОРОН".
 
 Примеры структур (ориентируйся, но можешь адаптировать под тип договора):
 
@@ -130,11 +130,12 @@ PROMPT_CLAIM = """
 Тебе передают черновые данные для претензии (досудебной).
 Нужно на их основе СФОРМИРОВАТЬ ЧЕРНОВИК ТЕКСТА ПРЕТЕНЗИИ.
 
-Требования к ответу:
+Требования:
 - язык: русский, деловой, без лишней воды;
+- не используй Markdown, списки с * и #, не используй эмодзи;
 - ориентируйся на ГК РФ и общую деловую практику;
 - НЕ придумывай конкретные статьи, если в описании их нет, но можешь аккуратно ссылаться на общие нормы (“в соответствии с действующим законодательством РФ”);
-- текст должен выглядеть как готовая претензия, которую юрист может чуть допилить и отправить.
+- текст должен выглядеть как готовая претензия, которую юрист может доработать и отправить.
 
 Структура:
 1) “Шапка” (к кому, от кого — на основе входных данных).
@@ -142,10 +143,10 @@ PROMPT_CLAIM = """
 3) Описание нарушений и обстоятельств.
 4) Требования заявителя.
 5) Срок для добровольного исполнения.
-6) Указание на возможные последствия при неисполнении (суд, взыскание неустойки и т.п.).
+6) Возможные последствия при неисполнении (суд, взыскание неустойки и т.п.).
 7) Место для подписи и контактных данных.
 
-Пожалуйста, выдай ОДИН цельный текст претензии, без Markdown, без списков с * и #.
+Выведи ОДИН цельный текст претензии, без комментариев к пользователю.
 """
 
 PROMPT_CLAUSE = """
@@ -159,10 +160,13 @@ PROMPT_CLAUSE = """
 
 Требования:
 - отвечай по-русски;
-- не используй Markdown и сложное форматирование;
+- не используй Markdown, эмодзи и сложное форматирование;
 - будь максимально практичным и прикладным, избегай лишней теории.
 
-Сначала сделай “Краткое объяснение: ...”, затем “Риски: ...”, затем “Как можно улучшить: ...”.
+Структура ответа:
+Краткое объяснение: ...
+Риски: ...
+Как можно улучшить: ...
 """
 
 PROMPT_QA = """
@@ -175,9 +179,11 @@ PROMPT_QA = """
 
 Требования:
 - отвечай по-русски;
-- не выдавай ответ как 100% юридическое заключение, это именно справка/ориентир;
-- можешь рекомендовать обратиться к юристу для финальной проверки важных документов;
-- не используй Markdown, списки со звёздочками и т.д., просто аккуратный текст с абзацами.
+- не используй Markdown, списки со звёздочками и эмодзи;
+- отвечай структурировано, но обычным текстом с абзацами;
+- давай ориентиры и объяснения, но не выдавай ответ как 100% юридическое заключение.
+
+В конце ответа можешь аккуратно напомнить, что для важных вопросов стоит показать ситуацию живому юристу.
 """
 
 # ----------------- ИНИЦИАЛИЗАЦИЯ GROQ -----------------
@@ -229,7 +235,7 @@ async def call_groq(system_prompt: str, user_query: str) -> str:
 
 def create_pdf_from_text(text: str) -> str:
     """
-    Рендерим многостраничный PDF c кириллицей.
+    Рендерим многостраничный PDF c кириллицей и нормальными полями.
     Возвращаем имя файла.
     """
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -239,9 +245,9 @@ def create_pdf_from_text(text: str) -> str:
     c = canvas.Canvas(filepath, pagesize=A4)
     width, height = A4
 
-    left_margin = 40
-    top_margin = height - 40
-    bottom_margin = 40
+    left_margin = 50
+    top_margin = height - 60
+    bottom_margin = 50
     line_height = 14
 
     font_name = PDF_FONT_NAME if PDF_FONT_NAME in pdfmetrics.getRegisteredFontNames() else "Helvetica"
@@ -249,8 +255,10 @@ def create_pdf_from_text(text: str) -> str:
 
     y = top_margin
 
-    for paragraph in text.split("\n"):
+    lines = text.split("\n")
+    for idx, paragraph in enumerate(lines):
         para = paragraph.rstrip()
+
         if not para:
             y -= line_height
             if y < bottom_margin:
@@ -259,14 +267,23 @@ def create_pdf_from_text(text: str) -> str:
                 y = top_margin
             continue
 
-        # Простой перенос по длине строки
+        # Если первая строка и содержит слово "ДОГОВОР" — центрируем как заголовок
+        is_title = (idx == 0 and "ДОГОВОР" in para.upper())
+
         max_chars = 100
-        for line in wrap(para, max_chars):
+        wrapped = wrap(para, max_chars) or [""]
+
+        for line in wrapped:
             if y < bottom_margin:
                 c.showPage()
                 c.setFont(font_name, 11)
                 y = top_margin
-            c.drawString(left_margin, y, line)
+            if is_title:
+                text_width = c.stringWidth(line, font_name, 11)
+                x = (width - text_width) / 2.0
+                c.drawString(x, y, line)
+            else:
+                c.drawString(left_margin, y, line)
             y -= line_height
 
     c.save()
@@ -277,9 +294,7 @@ def create_pdf_from_text(text: str) -> str:
 async def handle_contract(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
     """
     Сценарий: генерация договора + PDF.
-    Работает ИЗ ОДНОЙ КНОПКИ:
-    - если есть поля типа "Тип договора", "Стороны" и т.п. — используем их;
-    - если только общее поле "Запрос" — тоже работаем (свободный ввод).
+    Используется и с заранее собранными полями, и с одним свободным текстом.
     """
     raw_type = get_field(payload, "Тип_договора", "Тип договора")
     parties = get_field(payload, "Стороны")
@@ -301,8 +316,16 @@ async def handle_contract(payload: Dict[str, Any], request: Request) -> Dict[str
             f"Особые условия: {special or 'нет или не указаны'}"
         )
     else:
-        # если нет структурированных полей — работаем с общим запросом
-        brief = free_query or "Пользователь не дал никакого описания, договор сформировать невозможно."
+        brief = free_query or ""
+
+    if not brief.strip():
+        return {
+            "reply_text": (
+                "Пока недостаточно данных для договора. "
+                "Опиши хотя бы тип договора, стороны и предмет."
+            ),
+            "scenario": "contract",
+        }
 
     try:
         contract_text = await call_groq(PROMPT_CONTRACT_UNIVERSAL, brief)
@@ -311,8 +334,15 @@ async def handle_contract(payload: Dict[str, Any], request: Request) -> Dict[str
         base_url = str(request.base_url).rstrip("/")
         file_url = f"{base_url}/files/{filename}"
 
+        reply_text = (
+            "Черновик договора подготовлен. "
+            "Файл можно скачать по ссылке ниже.\n\n"
+            "Важно: это примерный текст, сформированный ИИ. "
+            "Перед подписанием проверь его и при необходимости согласуй с юристом."
+        )
+
         return {
-            "reply_text": "Готово! Я собрал черновик договора, лови файл:",
+            "reply_text": reply_text,
             "file_url": file_url,
             "scenario": "contract",
         }
@@ -345,7 +375,7 @@ async def handle_claim(payload: Dict[str, Any]) -> Dict[str, str]:
     else:
         query = free_query
 
-    if not query:
+    if not query or not query.strip():
         return {
             "reply_text": "Пока нет данных для претензии. Опиши ситуацию и что именно хочешь потребовать.",
             "scenario": "claim",
@@ -353,8 +383,13 @@ async def handle_claim(payload: Dict[str, Any]) -> Dict[str, str]:
 
     try:
         text = await call_groq(PROMPT_CLAIM, query)
+        reply_text = (
+            text
+            + "\n\nВажно: это примерный черновик претензии. "
+              "Перед отправкой доработай текст и, по возможности, согласуй его с юристом."
+        )
         return {
-            "reply_text": text,
+            "reply_text": reply_text,
             "scenario": "claim",
         }
     except Exception as e:
@@ -368,16 +403,21 @@ async def handle_claim(payload: Dict[str, Any]) -> Dict[str, str]:
 async def handle_clause(payload: Dict[str, Any]) -> Dict[str, str]:
     clause_text = get_field(payload, "Текст", "Фрагмент", "Clause", "Запрос", "query", "Query")
 
-    if not clause_text:
+    if not clause_text or not clause_text.strip():
         return {
-            "reply_text": "Пришли, пожалуйста, пункт договора или фрагмент текста, который нужно разобрать.",
+            "reply_text": "Пришли пункт договора или фрагмент текста, который нужно разобрать.",
             "scenario": "clause",
         }
 
     try:
         text = await call_groq(PROMPT_CLAUSE, clause_text)
+        reply_text = (
+            text
+            + "\n\nВажно: это ориентировочное разъяснение. "
+              "Для принятия серьёзных решений по договору стоит проконсультироваться с юристом."
+        )
         return {
-            "reply_text": text,
+            "reply_text": reply_text,
             "scenario": "clause",
         }
     except Exception as e:
@@ -391,7 +431,7 @@ async def handle_clause(payload: Dict[str, Any]) -> Dict[str, str]:
 async def handle_qa(payload: Dict[str, Any]) -> Dict[str, str]:
     question = get_field(payload, "Запрос", "query", "Question", "Вопрос")
 
-    if not question:
+    if not question or not question.strip():
         return {
             "reply_text": "Задай вопрос: по договору, претензии, рискам или рабочим процессам юриста.",
             "scenario": "qa",
@@ -399,8 +439,13 @@ async def handle_qa(payload: Dict[str, Any]) -> Dict[str, str]:
 
     try:
         text = await call_groq(PROMPT_QA, question)
+        reply_text = (
+            text
+            + "\n\nВажно: это общий ориентир, а не полноценное юридическое заключение. "
+              "В сложных ситуациях стоит показать материалы живому юристу."
+        )
         return {
-            "reply_text": text,
+            "reply_text": reply_text,
             "scenario": "qa",
         }
     except Exception as e:
@@ -415,7 +460,7 @@ async def handle_qa(payload: Dict[str, Any]) -> Dict[str, str]:
 app = FastAPI(
     title="LegalFox API (Groq, Railway)",
     description="Backend для LegalFox — ИИ-помощника юристам",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
@@ -427,35 +472,69 @@ async def legalfox_endpoint(
     """
     ОДНА ТОЧКА ВХОДА ДЛЯ ВСЕХ СЦЕНАРИЕВ.
 
-    В BotHelp ты можешь:
-    - либо всегда слать scenario="contract"/"claim"/"clause"/"qa";
-    - либо слать scenario="auto" или вообще не слать scenario — тогда мы сами решим по данным.
+    В BotHelp можно:
+    - передавать scenario="contract"/"claim"/"clause"/"qa";
+    - или передавать scenario="auto"/не передавать вовсе — тогда сценарий определится по данным.
     """
     logger.info("Incoming payload keys: %s", list(payload.keys()))
-    scenario = (payload.get("scenario") or payload.get("Сценарий") or "").strip().lower()
 
-    # Автоопределение сценария, если scenario пустой/auto
-    if not scenario or scenario == "auto":
-        # Если есть тип договора или поля по договору — считаем, что это contract
-        if any(
-            k in payload
-            for k in ["Тип_договора", "Тип договора", "Стороны", "Предмет", "Сроки и оплата", "Сроки", "Оплата"]
-        ):
+    raw_scenario = (payload.get("scenario") or payload.get("Сценарий") or "").strip().lower()
+
+    # Есть ли "претензионные" поля
+    has_claim_fields = any(
+        k in payload
+        for k in [
+            "Адресат",
+            "Основание",
+            "Нарушение_и_обстоятельства",
+            "Нарушение и обстоятельства",
+            "Требования",
+            "Срок_исполнения",
+            "Сроки исполнения",
+            "Контакты",
+        ]
+    )
+
+    # Есть ли "договорные" поля
+    has_contract_fields = any(
+        k in payload
+        for k in [
+            "Тип_договора",
+            "Тип договора",
+            "Стороны",
+            "Предмет",
+            "Сроки и оплата",
+            "Сроки",
+            "Оплата",
+            "Особые_условия",
+            "Особые условия",
+        ]
+    )
+
+    # Есть ли поля для разбора пункта
+    has_clause_fields = any(k in payload for k in ["Текст", "Фрагмент", "Clause"])
+
+    scenario = raw_scenario
+
+    # 1) Если сценарий явно передан и валиден — используем его, но с приоритетом claim по полям
+    if scenario in {"contract", "claim", "clause", "qa"}:
+        # Если есть явные поля претензии — насильно переключаемся на claim,
+        # чтобы кнопка "Черновик претензии" никогда не улетала в contract.
+        if has_claim_fields and scenario != "claim":
+            logger.info("Переназначаю scenario с %s на claim по набору полей", scenario)
+            scenario = "claim"
+    else:
+        # 2) Если сценарий не задан/левый — определяем автоматически
+        if has_claim_fields:
+            scenario = "claim"
+        elif has_clause_fields:
+            scenario = "clause"
+        elif has_contract_fields:
             scenario = "contract"
         else:
-            # иначе по ключевым словам в тексте
-            text_all = (
-                get_field(payload, "Запрос", "query", "Question", "Вопрос")
-                + " "
-                + get_field(payload, "Текст", "Фрагмент", "Clause")
-            ).lower()
-            if any(word in text_all for word in ["претензи", "досудебн", "претензия", "претензион"]):
-                scenario = "claim"
-            elif any(word in text_all for word in ["пункт", "клауза", "раздел", "договор", "формулировк"]):
-                scenario = "clause"
-            else:
-                scenario = "qa"
+            scenario = "qa"
 
+    # Роутинг по сценариям
     if scenario == "contract":
         return await handle_contract(payload, request)
     if scenario == "claim":
