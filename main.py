@@ -1,21 +1,25 @@
 import os
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-import httpx
 from fastapi import FastAPI, Body, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
 from groq import Groq
+
 from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-import re
 
 
-# ----------------- Логгер -----------------
+# -------------------------------------------------
+# ЛОГИРОВАНИЕ
+# -------------------------------------------------
 logger = logging.getLogger("legalfox")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
@@ -23,113 +27,27 @@ handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s
 logger.addHandler(handler)
 
 
-# ----------------- Конфиг -----------------
+# -------------------------------------------------
+# КОНФИГ
+# -------------------------------------------------
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = "llama-3.1-8b-instant"
 
-BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://legalfox.up.railway.app")
+# База для формирования ссылок на файлы
+BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+if not BASE_URL:
+    # запасной вариант – домен Railway
+    BASE_URL = "https://legalfox.up.railway.app"
 
-FILES_DIR = Path(__file__).parent / "files"
-FILES_DIR.mkdir(parents=True, exist_ok=True)
-
-FONT_PATH = Path(__file__).parent / "DejaVuSans.ttf"
-FONT_NAME = "DejaVuSans"
-
-if FONT_PATH.exists():
-    try:
-        pdfmetrics.registerFont(TTFont(FONT_NAME, str(FONT_PATH)))
-        logger.info("Шрифт %s зарегистрирован", FONT_NAME)
-    except Exception:
-        logger.exception("Не удалось зарегистрировать шрифт")
-        FONT_NAME = "Helvetica"
-else:
-    logger.warning("Файл шрифта %s не найден, используем Helvetica", FONT_PATH)
-    FONT_NAME = "Helvetica"
+# Каталог для PDF-файлов
+BASE_DIR = Path(__file__).parent
+FILES_DIR = BASE_DIR / "files"
+FILES_DIR.mkdir(exist_ok=True)
 
 
-# ----------------- Фолбэк -----------------
-FALLBACK_TEXT = (
-    "Сейчас я не могу обратиться к нейросети. Попробуй переформулировать запрос "
-    "или повторить чуть позже."
-)
-
-
-# ----------------- Промпты -----------------
-PROMPT_CONTRACT = """
-Ты — ИИ-помощник по составлению проектов гражданско-правовых договоров в РФ.
-
-На основе описания сторон, предмета, сроков, оплаты и особых условий составь
-черновик договора. Стиль — деловой, близкий к стандартным шаблонам, но без явного
-копирования конкретных бланков. Используй нейтральную формулировку.
-
-Обязательно:
-
-1. Структура с разделами типа:
-   1. Предмет договора
-   2. Права и обязанности сторон
-   3. Цена и порядок расчётов / Оплата
-   4. Срок действия договора
-   5. Ответственность сторон
-   6. Порядок разрешения споров
-   7. Заключительные положения
-
-2. Пиши по-русски, вежливо и формально.
-3. Строго запрещено использовать Markdown-разметку и любые **звёздочки**,
-   маркеры списков, подчёркивания и т.п. Выводи только обычный текст без оформления.
-4. Не указывай реальные реквизиты, оставляй под них пустые поля/подсказки.
-
-Текст должен быть полностью самодостаточным, чтобы его можно было распечатать
-и доработать юристом.
-"""
-
-PROMPT_CLAIM = """
-Ты — ИИ-помощник по составлению претензий (досудебных требований) в РФ.
-
-Составь структурированную претензию на основании входных данных.
-Структура текста (примерная):
-
-1. Шапка: кому направляется претензия (Адресат).
-2. Описание правового основания (например, Закон о защите прав потребителей,
-   договор и т.п.).
-3. Описание нарушения и фактических обстоятельств.
-4. Конкретные требования заявителя.
-5. Срок для добровольного исполнения требований.
-6. Контактные данные заявителя.
-7. Заключительный блок (предупреждение о возможном обращении в суд и т.п.).
-
-Пиши по-русски, официально-деловым стилем.
-
-Строго запрещено:
-- использовать Markdown-разметку (никаких **звёздочек**, списков с * или -,
-  заголовков и т.п.);
-- добавлять лишние декоративные символы.
-
-Выводи только обычный сплошной текст, разделённый абзацами. Оставляй место под ФИО,
-подпись, дату при необходимости, но не подставляй реальные личные данные.
-"""
-
-PROMPT_CLAUSE = """
-Ты — ИИ-помощник, который анализирует и переписывает отдельные пункты договора.
-
-Пользователь присылает один или несколько пунктов договора. Твоя задача:
-
-1. Кратко и понятным языком объяснить суть условий.
-2. Показать потенциальные риски и односторонние формулировки.
-3. При необходимости предложить более сбалансированную формулировку.
-
-Структура ответа:
-
-1) Краткое объяснение смысла пункта.
-2) Возможные риски/на что обратить внимание.
-3) Вариант переработанной формулировки (если уместно).
-
-Строго запрещено использовать Markdown-разметку и любые **звёздочки**, списки с * или -.
-Только обычный текст.
-"""
-
-
-# ----------------- Groq клиент -----------------
-client: Groq | None = None
+# -------------------------------------------------
+# ИНИЦИАЛИЗАЦИЯ GROQ
+# -------------------------------------------------
+client: Optional[Groq] = None
 if GROQ_API_KEY:
     try:
         client = Groq(api_key=GROQ_API_KEY)
@@ -137,23 +55,60 @@ if GROQ_API_KEY:
     except Exception:
         logger.exception("Не удалось инициализировать Groq client")
 else:
-    logger.warning("GROQ_API_KEY не задан — будет всегда использоваться fallback")
+    logger.warning("GROQ_API_KEY не задан — нейросеть недоступна, будет fallback-текст")
 
 
-async def call_groq(system_prompt: str, user_query: str) -> str:
+# -------------------------------------------------
+# PDF: ШРИФТЫ
+# -------------------------------------------------
+try:
+    # ожидаем, что файл лежит в fonts/DejaVuSans.ttf
+    pdfmetrics.registerFont(TTFont("DejaVuSans", str(BASE_DIR / "fonts" / "DejaVuSans.ttf")))
+    DEFAULT_FONT = "DejaVuSans"
+    logger.info("Шрифт DejaVuSans подключён")
+except Exception:
+    DEFAULT_FONT = "Helvetica"
+    logger.warning("Не удалось подключить DejaVuSans, используется Helvetica")
+
+
+# -------------------------------------------------
+# УТИЛИТЫ
+# -------------------------------------------------
+def bool_from_payload(value: Any) -> bool:
+    """Преобразуем поле Premium (1/0, true/false, да/нет) в bool."""
+    if value is None:
+        return False
+    s = str(value).strip().lower()
+    return s in {"1", "true", "yes", "да", "y", "on", "+"}
+
+
+def clean_markdown(text: str) -> str:
+    """Убираем **жирный**, маркированные списки и лишний Markdown."""
+    if not text:
+        return ""
+    # **bold**
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text, flags=re.DOTALL)
+    # __bold__
+    text = re.sub(r"__(.*?)__", r"\1", text, flags=re.DOTALL)
+    # маркеры списков в начале строк "-", "*", "•"
+    text = re.sub(r"^\s*[-*•]\s+", "", text, flags=re.MULTILINE)
+    return text.strip()
+
+
+async def call_groq(system_prompt: str, user_prompt: str) -> str:
     if not client:
-        raise RuntimeError("GROQ_API_KEY is not set or Groq client init failed")
+        raise RuntimeError("Groq client is not available")
 
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_query.strip()},
+        {"role": "user", "content": user_prompt},
     ]
 
     chat_completion = client.chat.completions.create(
-        model=GROQ_MODEL,
+        model="llama-3.1-8b-instant",
         messages=messages,
-        temperature=0.4,
-        max_tokens=1100,
+        temperature=0.5,
+        max_tokens=900,
         top_p=1,
     )
 
@@ -161,309 +116,296 @@ async def call_groq(system_prompt: str, user_query: str) -> str:
     return content.strip()
 
 
-# ----------------- Вспомогательные функции -----------------
-def clean_ai_text(text: str) -> str:
-    """Убираем Markdown-жирный/курсив и одиночные звёздочки."""
-    if not text:
-        return ""
+def create_pdf(filename: str, title: str, body_text: str) -> str:
+    """Создаёт PDF и возвращает абсолютный URL для скачивания."""
+    file_path = FILES_DIR / filename
 
-    # убираем **...**, *...*, ***...***
-    text = re.sub(r"\*{1,3}(.+?)\*{1,3}", r"\1", text, flags=re.DOTALL)
-    # на всякий случай убираем оставшиеся звёздочки
-    text = text.replace("*", "")
-    return text.strip()
-
-
-def is_premium(payload: Dict[str, Any]) -> bool:
-    """Определяем премиум: либо флаг из BotHelp, либо форс по сценарию."""
-    # форс-премиум из эндпоинта (scenario *_premium)
-    if payload.get("_force_premium"):
-        return True
-
-    raw = (
-        str(payload.get("subscription")
-            or payload.get("Subscription")
-            or payload.get("Подписка")
-            or "")
-        .strip()
-        .lower()
+    doc = SimpleDocTemplate(
+        str(file_path),
+        pagesize=A4,
+        rightMargin=40,
+        leftMargin=40,
+        topMargin=60,
+        bottomMargin=60,
     )
-    return raw in {"1", "true", "yes", "да", "premium", "премиум"}
 
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "LegalTitle",
+        parent=styles["Heading1"],
+        fontName=DEFAULT_FONT,
+        fontSize=16,
+        leading=20,
+        alignment=1,  # по центру
+        spaceAfter=20,
+    )
+    normal_style = ParagraphStyle(
+        "LegalNormal",
+        parent=styles["Normal"],
+        fontName=DEFAULT_FONT,
+        fontSize=11,
+        leading=14,
+        spaceAfter=6,
+    )
 
-def create_pdf(filename: str, title: str, body: str) -> Path:
-    filepath = FILES_DIR / filename
-    c = canvas.Canvas(str(filepath), pagesize=A4)
+    story = []
+    if title:
+        story.append(Paragraph(title, title_style))
+        story.append(Spacer(1, 12))
 
-    width, height = A4
-    left_margin = 40
-    top_margin = height - 60
-    line_height = 16
+    for line in body_text.split("\n"):
+        line = line.strip()
+        if not line:
+            story.append(Spacer(1, 8))
+        else:
+            story.append(Paragraph(line, normal_style))
 
-    c.setFont(FONT_NAME, 18)
-    c.drawString(left_margin, top_margin, title)
+    doc.build(story)
 
-    c.setFont(FONT_NAME, 12)
-    y = top_margin - 2 * line_height
-
-    for paragraph in body.split("\n"):
-        text = paragraph.strip()
-        if not text:
-            y -= line_height
-            continue
-
-        words = text.split()
-        line = ""
-        for w in words:
-            test_line = (line + " " + w).strip()
-            if pdfmetrics.stringWidth(test_line, FONT_NAME, 12) > (width - 2 * left_margin):
-                c.drawString(left_margin, y, line)
-                y -= line_height
-                line = w
-            else:
-                line = test_line
-
-        if line:
-            c.drawString(left_margin, y, line)
-            y -= line_height
-
-        y -= 4
-
-        if y < 80:
-            c.showPage()
-            c.setFont(FONT_NAME, 12)
-            y = height - 60
-
-    c.save()
-    logger.info("PDF создан: %s", filepath)
-    return filepath
-
-
-def build_file_url(filename: str) -> str:
     return f"{BASE_URL}/files/{filename}"
 
 
-# ----------------- FastAPI -----------------
+# -------------------------------------------------
+# PROMPTS
+# -------------------------------------------------
+CONTRACT_SYSTEM_PROMPT = """
+Ты LegalFox — ИИ-помощник по подготовке гражданско-правовых договоров в РФ.
+
+Твоя задача — на основе входных полей собрать ПРИМЕРНЫЙ текст договора.
+Важно:
+
+1) Пиши по-русски, деловым, но понятным языком.
+2) НЕ используй Markdown, звёздочки, списки, разметку — только чистый текст.
+3) Структурируй текст блоками с заголовками: 
+   - ПРЕАМБУЛА
+   - ПРЕДМЕТ ДОГОВОРА
+   - ПРАВА И ОБЯЗАННОСТИ СТОРОН
+   - СРОК ДЕЙСТВИЯ ДОГОВОРА
+   - ПОРЯДОК РАСЧЁТОВ
+   - ОТВЕТСТВЕННОСТЬ СТОРОН
+   - ПРОЧИЕ УСЛОВИЯ
+4) Учитывай, что это черновик: можешь добавлять нейтральные формулировки-заглушки, но не фантазируй конкретные цифры, если их не дали.
+5) Не добавляй комментариев "я ИИ" и т.п.
+"""
+
+CLAIM_SYSTEM_PROMPT = """
+Ты LegalFox — ИИ-помощник по подготовке претензий (досудебных требований) в РФ.
+
+Составь ПРИМЕРНУЮ претензию с опорой на входные поля.
+
+Требования к тексту:
+
+1) Пиши по-русски, официально-деловым стилем, без Markdown и разметки.
+2) Сохрани структуру:
+   - Адресат
+   - Вводная часть (на каком основании обращение)
+   - Описание нарушения и обстоятельств
+   - Требования заявителя
+   - Срок для добровольного исполнения требований
+   - Контактные данные заявителя
+   - Заключительный блок (о возможном обращении в суд)
+3) Не придумывай конкретные статьи и номера документов, если их нет во входных данных.
+"""
+
+CLAUSE_SYSTEM_PROMPT = """
+Ты LegalFox — ИИ-помощник, который объясняет и улучшает отдельные пункты договоров.
+
+Пользователь присылает текст пункта или фрагмента договора.
+Твоя задача:
+
+1) Кратко и понятным языком объяснить, о чём этот пункт.
+2) Указать возможные риски для стороны пользователя.
+3) Предложить улучшенную, более безопасную формулировку (если это уместно).
+
+Формат ответа:
+- сначала 2–4 предложения объяснения сути пункта;
+- затем 2–5 предложений о рисках;
+- затем вариант улучшенной формулировки.
+
+НЕ используй Markdown, не применяй **звёздочки** и списки, только обычный текст с абзацами.
+"""
+
+
+# -------------------------------------------------
+# FASTAPI
+# -------------------------------------------------
 app = FastAPI(
     title="LegalFox API (Groq, Railway)",
-    description="Backend для LegalFox — ИИ-помощника юристам и пользователям",
-    version="1.0.0",
+    description="Backend для LegalFox — ИИ-помощника юристам и не только",
+    version="0.3.0",
 )
 
-
-@app.get("/files/{filename}")
-async def download_file(filename: str):
-    filepath = FILES_DIR / filename
-    if not filepath.exists():
-        raise HTTPException(status_code=404, detail="Файл не найден")
-    return FileResponse(str(filepath), media_type="application/pdf", filename=filename)
+# раздача PDF
+app.mount("/files", StaticFiles(directory=str(FILES_DIR)), name="files")
 
 
-# ----------------- Логика сценариев -----------------
-async def handle_contract(payload: Dict[str, Any]) -> Dict[str, str]:
-    prem = is_premium(payload)
-
-    contract_type = payload.get("Тип_договора") or payload.get("Тип договора") or ""
-    parties = payload.get("Стороны", "")
-    subject = payload.get("Предмет", "")
-    terms = payload.get("Сроки", "") or payload.get("Сроки и оплата", "")
-    payment = payload.get("Оплата", "")
-    special = payload.get("Особые_условия") or payload.get("Особые условия") or ""
-
-    user_query = (
-        f"Тип договора: {contract_type}\n"
-        f"Стороны: {parties}\n"
-        f"Предмет: {subject}\n"
-        f"Сроки: {terms}\n"
-        f"Оплата: {payment}\n"
-        f"Особые условия: {special}\n"
-    )
-
-    try:
-        draft_raw = await call_groq(PROMPT_CONTRACT, user_query)
-        draft_text = clean_ai_text(draft_raw)
-    except Exception:
-        logger.exception("Ошибка Groq при генерации договора")
-        return {
-            "reply_text": FALLBACK_TEXT,
-            "file_url": "",
-            "scenario": "contract",
-        }
-
-    if prem:
-        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        filename = f"contract_{ts}.pdf"
-        body_for_pdf = draft_text + (
-            "\n\nВажно: это примерный черновик договора. Перед подписанием обязательно "
-            "проверь текст и, по возможности, согласуй его с юристом."
-        )
-        create_pdf(filename, "ДОГОВОР (ЧЕРНОВИК)", body_for_pdf)
-
-        reply = (
-            "Черновик договора подготовлен. Файл можно скачать по ссылке ниже.\n\n"
-            "Важно: это примерный черновик, сформированный ИИ. "
-            "Перед подписанием обязательно проверь текст и, по возможности, "
-            "согласуй его с юристом."
-        )
-        return {
-            "reply_text": reply,
-            "file_url": build_file_url(filename),
-            "scenario": "contract",
-        }
-
-    reply = (
-        "Черновик договора (текст):\n\n"
-        f"{draft_text}\n\n"
-        "Важно: это примерный черновик, сформированный ИИ. "
-        "Перед подписанием обязательно проверь текст и, по возможности, "
-        "согласуй его с юристом."
-    )
-    return {
-        "reply_text": reply,
-        "file_url": "",
-        "scenario": "contract",
-    }
-
-
-async def handle_claim(payload: Dict[str, Any]) -> Dict[str, str]:
-    prem = is_premium(payload)
-
-    adresat = payload.get("Адресат", "")
-    basis = payload.get("Основание", "")
-    facts = payload.get("Нарушение_и_обстоятельства") or payload.get(
-        "Нарушение и обстоятельства", ""
-    )
-    demands = payload.get("Требования", "")
-    deadline = payload.get("Срок_исполнения") or payload.get("Сроки исполнения", "")
-    contacts = payload.get("Контакты", "")
-
-    user_query = (
-        f"Адресат: {adresat}\n"
-        f"Правовое основание: {basis}\n"
-        f"Нарушение и обстоятельства: {facts}\n"
-        f"Требования заявителя: {demands}\n"
-        f"Срок добровольного исполнения требований: {deadline}\n"
-        f"Контактные данные заявителя: {contacts}\n"
-    )
-
-    try:
-        draft_raw = await call_groq(PROMPT_CLAIM, user_query)
-        draft_text = clean_ai_text(draft_raw)
-    except Exception:
-        logger.exception("Ошибка Groq при генерации претензии")
-        return {
-            "reply_text": FALLBACK_TEXT,
-            "file_url": "",
-            "scenario": "claim",
-        }
-
-    if prem:
-        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        filename = f"claim_{ts}.pdf"
-        body_for_pdf = draft_text + (
-            "\n\nВажно: это примерный черновик претензии. Перед направлением адресату "
-            "обязательно проверь текст и, по возможности, согласуй его с юристом."
-        )
-        create_pdf(filename, "ПРЕТЕНЗИЯ (ЧЕРНОВИК)", body_for_pdf)
-
-        reply = (
-            "Черновик претензии подготовлен. Файл можно скачать по ссылке ниже.\n\n"
-            "Важно: это примерный черновик, сформированный ИИ. "
-            "Перед отправкой обязательно проверь текст и, по возможности, "
-            "согласуй его с юристом."
-        )
-        return {
-            "reply_text": reply,
-            "file_url": build_file_url(filename),
-            "scenario": "claim",
-        }
-
-    reply = (
-        "Черновик претензии (текст):\n\n"
-        f"{draft_text}\n\n"
-        "Важно: это примерный черновик, сформированный ИИ. "
-        "Перед отправкой обязательно проверь текст и, по возможности, "
-        "согласуй его с юристом."
-    )
-    return {
-        "reply_text": reply,
-        "file_url": "",
-        "scenario": "claim",
-    }
-
-
-async def handle_clause(payload: Dict[str, Any]) -> Dict[str, str]:
-    text = payload.get("Текст") or payload.get("text") or payload.get("Описание") or ""
-    if not text.strip():
-        return {
-            "reply_text": "Пока нет данных. Напиши текст/описание, с которым нужно помочь.",
-            "file_url": "",
-            "scenario": "clause",
-        }
-
-    try:
-        answer_raw = await call_groq(PROMPT_CLAUSE, text)
-        answer = clean_ai_text(answer_raw)
-    except Exception:
-        logger.exception("Ошибка Groq при анализе пункта")
-        return {
-            "reply_text": FALLBACK_TEXT,
-            "file_url": "",
-            "scenario": "clause",
-        }
-
-    return {
-        "reply_text": answer,
-        "file_url": "",
-        "scenario": "clause",
-    }
-
-
-# ----------------- Endpoint -----------------
 @app.post("/legalfox")
-async def legalfox_endpoint(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
+async def legalfox_endpoint(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """
+    Главный endpoint, на который смотрит BotHelp.
+    Ожидаемые поля:
+    - scenario: 'contract' | 'claim' | 'clause'
+    - Premium: 1/0 (или true/false и т.п.)
+    - поля с данными по договору/претензии/пункту.
+    """
     logger.info("Incoming payload keys: %s", list(payload.keys()))
 
-    raw_scenario = (
-        payload.get("scenario")
-        or payload.get("Сценарий")
-        or payload.get("сценарий")
-        or "contract"
-    )
-    raw_scenario = str(raw_scenario).strip().lower()
+    scenario = (payload.get("scenario") or "").strip().lower() or "contract"
+    is_premium = bool_from_payload(payload.get("Premium"))
 
-    # форс-премиум по сценарию вида contract_premium / claim_premium
-    force_premium = False
-    if raw_scenario in ("contract_premium", "claim_premium"):
-        force_premium = True
-        scenario = raw_scenario.split("_")[0]  # contract / claim
-    else:
-        scenario = raw_scenario
+    logger.info("Scenario=%s Premium=%s", scenario, is_premium)
 
-    payload["_force_premium"] = force_premium
-
+    # ------------------------ Договор ------------------------
     if scenario == "contract":
-        result = await handle_contract(payload)
-    elif scenario == "claim":
-        result = await handle_claim(payload)
-    elif scenario == "clause":
-        result = await handle_clause(payload)
-    else:
-        logger.info("Неизвестный сценарий: %s", scenario)
-        result = {
-            "reply_text": FALLBACK_TEXT,
-            "file_url": "",
-            "scenario": scenario,
+        type_raw = payload.get("Тип_договора") or payload.get("Тип договора") or ""
+        parties = payload.get("Стороны") or ""
+        subject = payload.get("Предмет") or ""
+        terms = payload.get("Сроки") or ""
+        payment = payload.get("Оплата") or ""
+        special = payload.get("Особые_условия") or payload.get("Особые условия") or ""
+
+        user_prompt = (
+            f"Тип договора: {type_raw}\n\n"
+            f"Стороны: {parties}\n\n"
+            f"Предмет договора: {subject}\n\n"
+            f"Сроки: {terms}\n\n"
+            f"Порядок оплаты: {payment}\n\n"
+            f"Особые условия и риски: {special}"
+        )
+
+        try:
+            text = await call_groq(CONTRACT_SYSTEM_PROMPT, user_prompt)
+            text = clean_markdown(text)
+        except Exception as e:
+            logger.exception("Groq error (contract): %s", e)
+            raise HTTPException(
+                status_code=503,
+                detail="Сейчас я не могу обратиться к нейросети. Попробуй повторить позже."
+            )
+
+        if is_premium:
+            # генерируем PDF
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"contract_{ts}.pdf"
+            file_url = create_pdf(filename, "ДОГОВОР", text)
+
+            reply_text = (
+                "Черновик договора подготовлен. Файл можно скачать по ссылке ниже.\n\n"
+                "Важно: это примерный черновик, сформированный ИИ. "
+                "Перед подписанием обязательно проверь текст и, по возможности, согласуй его с юристом."
+            )
+
+            return {
+                "reply_text": reply_text,
+                "file_url": file_url,
+                "scenario": "contract",
+            }
+        else:
+            reply_text = (
+                text
+                + "\n\nВажно: это примерный черновик, сформированный ИИ. "
+                  "Перед подписанием обязательно проверь текст и, по возможности, согласуй его с юристом.\n\n"
+                  "Сейчас я показал тебе черновик в виде текста. "
+                  "PDF-документ, оформленный и готовый к печати/отправке, доступен по подписке."
+            )
+            return {
+                "reply_text": reply_text,
+                "scenario": "contract",
+            }
+
+    # ------------------------ Претензия ------------------------
+    if scenario == "claim":
+        adresat = payload.get("Адресат") or ""
+        base = payload.get("Основание") or ""
+        violation = payload.get("Нарушение_и_обстоятельства") or payload.get("Нарушение и обстоятельства") or ""
+        demands = payload.get("Требования") or ""
+        deadline = payload.get("Срок_исполнения") or payload.get("Сроки исполнения") or ""
+        contacts = payload.get("Контакты") or ""
+
+        user_prompt = (
+            f"Адресат: {adresat}\n\n"
+            f"Основание обращения: {base}\n\n"
+            f"Суть нарушения и обстоятельства: {violation}\n\n"
+            f"Требования заявителя: {demands}\n\n"
+            f"Срок добровольного исполнения требований: {deadline}\n\n"
+            f"Контактные данные заявителя: {contacts}"
+        )
+
+        try:
+            text = await call_groq(CLAIM_SYSTEM_PROMPT, user_prompt)
+            text = clean_markdown(text)
+        except Exception as e:
+            logger.exception("Groq error (claim): %s", e)
+            raise HTTPException(
+                status_code=503,
+                detail="Сейчас я не могу обратиться к нейросети. Попробуй повторить позже."
+            )
+
+        if is_premium:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"claim_{ts}.pdf"
+            file_url = create_pdf(filename, "ПРЕТЕНЗИЯ", text)
+
+            reply_text = (
+                "Черновик претензии подготовлен. Файл можно скачать по ссылке ниже.\n\n"
+                "Важно: это примерный черновик, сформированный ИИ. "
+                "Перед отправкой обязательно проверь текст и, по возможности, согласуй его с юристом."
+            )
+
+            return {
+                "reply_text": reply_text,
+                "file_url": file_url,
+                "scenario": "claim",
+            }
+        else:
+            reply_text = (
+                text
+                + "\n\nВажно: это примерный черновик, сформированный ИИ. "
+                  "Перед отправкой обязательно проверь текст и, по возможности, согласуй его с юристом.\n\n"
+                  "Сейчас я показал тебе черновик в виде текста. "
+                  "PDF-версия, оформленная и готовая к печати/отправке, доступна только по подписке."
+            )
+            return {
+                "reply_text": reply_text,
+                "scenario": "claim",
+            }
+
+    # ------------------------ Помощь с пунктами ------------------------
+    if scenario == "clause":
+        clause_text = (
+            payload.get("Текст")
+            or payload.get("Текст_пункта")
+            or payload.get("Текст пункта")
+            or ""
+        )
+
+        if not clause_text.strip():
+            return {
+                "reply_text": "Пока нет данных. Напиши текст/описание, с которым нужно помочь.",
+                "scenario": "clause",
+            }
+
+        try:
+            text = await call_groq(CLAUSE_SYSTEM_PROMPT, clause_text)
+            text = clean_markdown(text)
+        except Exception as e:
+            logger.exception("Groq error (clause): %s", e)
+            raise HTTPException(
+                status_code=503,
+                detail="Сейчас я не могу обратиться к нейросети. Попробуй повторить позже."
+            )
+
+        return {
+            "reply_text": text,
+            "scenario": "clause",
         }
 
-    logger.info(
-        "Scenario=%s (raw=%s, force_premium=%s) ответ готов, file_url=%s",
-        result.get("scenario"),
-        raw_scenario,
-        force_premium,
-        result.get("file_url"),
-    )
-    return result
+    # ------------------------ Неизвестный сценарий ------------------------
+    logger.info("Неизвестный сценарий: %s", scenario)
+    return {
+        "reply_text": "Пока я не понимаю, что именно нужно сделать. Попробуй выбрать одну из кнопок в меню бота.",
+        "scenario": "unknown",
+    }
 
 
 @app.get("/")
