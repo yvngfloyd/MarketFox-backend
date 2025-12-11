@@ -159,7 +159,6 @@ def parse_with_file_flag(payload: Dict[str, Any]) -> bool:
     """
     Интерпретируем флаг with_file.
     Любое НЕпустое значение, кроме '0' / 'false' / 'нет' — считаем истиной.
-    Это делает интеграцию с BotHelp максимально терпимой к формату.
     """
     raw = str(
         payload.get("with_file")
@@ -250,9 +249,10 @@ async def handle_contract(payload: Dict[str, Any], with_file: bool) -> Tuple[str
     if with_file:
         filename = create_pdf_from_text("ДОГОВОР (ЧЕРНОВИК)", text, prefix="contract")
         file_url = f"{BASE_URL}/files/{filename}"
+        # ВАЖНО: здесь НЕ вставляем сам URL в текст, чтобы не было дубля.
         reply = (
-            "Черновик договора подготовлен. Файл можно скачать по ссылке ниже.\n\n"
-            f"{file_url}\n\n"
+            "Черновик договора подготовлен. Файл с оформленным черновиком "
+            "я прикрепил ниже в виде документа.\n\n"
             "Важно: это примерный черновик, сформированный ИИ. "
             "Перед подписанием обязательно проверь текст и, по возможности, согласуй его с юристом."
         )
@@ -295,9 +295,10 @@ async def handle_claim(payload: Dict[str, Any], with_file: bool) -> Tuple[str, O
     if with_file:
         filename = create_pdf_from_text("ПРЕТЕНЗИЯ (ЧЕРНОВИК)", text, prefix="claim")
         file_url = f"{BASE_URL}/files/{filename}"
+        # Тоже не вставляем URL в текст.
         reply = (
-            "Черновик претензии подготовлен. Файл можно скачать по ссылке ниже.\n\n"
-            f"{file_url}\n\n"
+            "Черновик претензии подготовлен. Оформленный PDF-файл "
+            "я прикрепил ниже в виде документа.\n\n"
             "Важно: это примерный черновик претензии, сформированный ИИ. "
             "Перед отправкой обязательно проверь текст и, по возможности, согласуй его с юристом."
         )
@@ -335,7 +336,7 @@ async def handle_clause(payload: Dict[str, Any]) -> Tuple[str, Optional[str]]:
 app = FastAPI(
     title="LegalFox API (Groq, Railway)",
     description="Backend для LegalFox — ИИ-помощника юристам и пользователям",
-    version="0.9.0",
+    version="0.9.1",
 )
 
 
@@ -371,7 +372,6 @@ async def legalfox_endpoint(payload: Dict[str, Any] = Body(...)) -> Dict[str, An
         "reply_text": reply_text,
         "scenario": scenario_name,
     }
-    # file_url добавляем ТОЛЬКО когда реально есть файл
     if file_url:
         response["file_url"] = file_url
 
