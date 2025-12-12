@@ -389,8 +389,8 @@ async def handle_clause(payload: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     if not clause_text.strip():
         return (
             "Пока нет данных. Напиши, пожалуйста, свой вопрос или вставь текст пункта/договора, "
-            "с которым нужно помочь.", 
-            None
+            "с которым нужно помочь.",
+            None,
         )
 
     try:
@@ -408,15 +408,31 @@ async def handle_clause(payload: Dict[str, Any]) -> Tuple[str, Optional[str]]:
 app = FastAPI(
     title="LegalFox API (Groq, Railway)",
     description="Backend для LegalFox — ИИ-помощника по юридическим документам",
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
 @app.post("/legalfox")
 async def legalfox_endpoint(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     logger.info("Incoming payload keys: %s", list(payload.keys()))
-    scenario = str(payload.get("scenario", "contract")).strip().lower()
+
+    # 1) Читаем scenario как есть
+    scenario_raw = str(payload.get("scenario") or "").strip().lower()
+
+    # 2) Авто-распознавание «чата», если scenario пустой/левый, но текст есть
+    has_chat_text = any(
+        (payload.get("Текст"), payload.get("Пункт"), payload.get("Clause"),
+         payload.get("Запрос"), payload.get("Вопрос"))
+    )
+    if scenario_raw not in ("contract", "claim", "clause") and has_chat_text:
+        scenario = "clause"
+    else:
+        scenario = scenario_raw or "contract"
+
     with_file = parse_with_file_flag(payload)
+
+    reply_text: str
+    file_url: Optional[str] = None
 
     try:
         if scenario == "contract":
@@ -430,7 +446,9 @@ async def legalfox_endpoint(payload: Dict[str, Any] = Body(...)) -> Dict[str, An
             scenario_name = "clause"
         else:
             logger.info("Неизвестный сценарий: %s", scenario)
-            reply_text = "Пока нет данных. Напиши текст или выбери нужный раздел в меню бота."
+            reply_text = (
+                "Пока нет данных. Напиши текст или выбери нужный раздел в меню бота."
+            )
             file_url = None
             scenario_name = scenario or "unknown"
 
@@ -440,13 +458,12 @@ async def legalfox_endpoint(payload: Dict[str, Any] = Body(...)) -> Dict[str, An
         file_url = None
         scenario_name = scenario or "error"
 
+    # ВАЖНО: всегда возвращаем file_url (даже пустой), чтобы BotHelp затирал старое значение
     response: Dict[str, Any] = {
         "reply_text": reply_text,
         "scenario": scenario_name,
+        "file_url": file_url or "",
     }
-    if file_url:
-        response["file_url"] = file_url
-
     return response
 
 
