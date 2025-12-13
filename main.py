@@ -4,7 +4,7 @@ import uuid
 import time
 import sqlite3
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 import httpx
 from fastapi import FastAPI, Body, Request
@@ -26,7 +26,7 @@ if not logger.handlers:
 
 
 # ----------------- Конфиг -----------------
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")  # напр. https://legalfox.up.railway.app
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 FILES_DIR = os.getenv("FILES_DIR", "files")
 DB_PATH = os.getenv("DB_PATH", "legalfox.db")
 
@@ -64,15 +64,9 @@ PROMPT_CONTRACT = """
 7) Суммы/сроки:
    - если сумма/срок не указаны — оставь понятное место: "___ рублей", "___ календарных дней"
    - не пиши случайные числа.
-8) Если "особые условия" содержат важные пункты (штрафы, порядок передачи, конфиденциальность, подсудность и т.д.) —
-   встрои их в соответствующие разделы.
-9) В конце:
-   - "Реквизиты и подписи сторон" с аккуратными полями.
-   - Для физлиц: ФИО, паспорт: ___, адрес: ___, телефон/email: ___
-   - Для юрлиц/ИП: наименование, ИНН/ОГРН(ОГРНИП): ___, адрес, р/с, банк, БИК, к/с: ___
-   Определи тип стороны по входным данным (если явно написано ООО/ИП — используй соответствующий блок).
-   Если непонятно — сделай универсально: "ФИО/Наименование: ___".
-10) Документ должен быть пригоден как черновик и выглядеть аккуратно: короткие абзацы, пустые строки между разделами.
+8) Если "особые условия" содержат важные пункты — встрои их в соответствующие разделы.
+9) В конце: "Реквизиты и подписи сторон" с полями. Ничего не выдумывай — если нет данных, "___".
+10) Аккуратная верстка: короткие абзацы, пустые строки между разделами.
 """
 
 PROMPT_CLAIM = """
@@ -81,20 +75,18 @@ PROMPT_CLAIM = """
 
 Жёсткие правила (обязательно):
 1) Без Markdown.
-2) Не используй заглушки вида "СТОРОНА_1", "АДРЕС_1", "СУММА_1" и т.п.
-   Если данных нет — "___". Если есть — вставляй как есть, без кавычек.
-3) Ничего не выдумывай: даты, суммы, реквизиты, нормы закона — только если пользователь дал их явно.
-   Если не дал — оставь "___" или нейтральную формулировку без ссылок на конкретные статьи.
+2) Не используй заглушки вида "СТОРОНА_1", "АДРЕС_1", "СУММА_1".
+   Если данных нет — "___". Если есть — вставляй как есть.
+3) Ничего не выдумывай: даты, суммы, реквизиты, нормы закона — только если пользователь дал явно.
 4) Структура:
-   - Кому: ___
-   - От кого: ___
+   - Кому / От кого
    - Заголовок: "ПРЕТЕНЗИЯ"
-   - Описание обстоятельств (кратко, по делу)
-   - Требования (конкретно)
-   - Срок исполнения требований: ___ дней (если не указан)
+   - Обстоятельства
+   - Требования
+   - Срок исполнения: ___ дней (если не указан)
    - Приложения (если уместно)
    - Дата/подпись/контакты
-5) Текст должен выглядеть как документ: абзацы, пустые строки между блоками.
+5) Документный вид: абзацы, пустые строки.
 """
 
 PROMPT_CLAUSE = """
@@ -133,26 +125,35 @@ def safe_filename(prefix: str) -> str:
     return f"{prefix}_{ts}_{uuid.uuid4().hex[:8]}.pdf"
 
 
-def pick_uid(payload: Dict[str, Any]) -> str:
-    for key in [
+def pick_uid(payload: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    КРИТИЧНО: UID должен быть стабильным.
+    В BotHelp часто "cuid" может меняться — поэтому:
+    1) bh_user_id
+    2) user_id
+    3) остальные варианты
+    4) cuid (ПОСЛЕДНИМ)
+    """
+    priority = [
+        "bh_user_id",
         "user_id",
         "tg_user_id",
         "telegram_user_id",
         "messenger_user_id",
-        "bh_user_id",
         "bothelp_user_id",
         "cuid",
-    ]:
+    ]
+    for key in priority:
         v = payload.get(key)
         if v is None:
             continue
         v = str(v).strip()
         if v:
-            return v
-    return ""
+            return v, key
+    return "", ""
 
 
-# ----------------- БД (trial 1 PDF) -----------------
+# ----------------- БД -----------------
 def db_init():
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
@@ -205,7 +206,7 @@ def consume_free(uid: str):
     logger.info("Trial PDF списан uid=%s", uid)
 
 
-# ----------------- PDF (кириллица) -----------------
+# ----------------- PDF -----------------
 def ensure_font_name() -> str:
     try:
         font_path = os.path.join("fonts", "DejaVuSans.ttf")
@@ -268,7 +269,7 @@ def render_pdf(text: str, out_path: str, title: str):
     c.save()
 
 
-# ----------------- LLM (Groq) -----------------
+# ----------------- LLM -----------------
 async def call_groq(system_prompt: str, user_content: str) -> str:
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY not set")
@@ -295,7 +296,7 @@ async def call_groq(system_prompt: str, user_content: str) -> str:
 
 
 # ----------------- FastAPI -----------------
-app = FastAPI(title="LegalFox API", version="1.2.3")
+app = FastAPI(title="LegalFox API", version="1.2.4")
 
 os.makedirs(FILES_DIR, exist_ok=True)
 app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
@@ -333,21 +334,19 @@ def get_with_file_requested(payload: Dict[str, Any]) -> bool:
 
 
 def file_url_for(filename: str, request: Request) -> str:
-    # Всегда возвращаем публичный URL:
-    # 1) если PUBLIC_BASE_URL задан — берём его
-    # 2) иначе берём домен входящего запроса
     base = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
     return f"{base}/files/{filename}"
 
 
 @app.post("/legalfox")
 async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
-    logger.info("Incoming payload keys: %s", list(payload.keys()))
-
     scenario_raw = payload.get("scenario") or payload.get("Сценарий") or payload.get("сценарий") or "contract"
     scenario = scenario_alias(str(scenario_raw))
 
-    uid = pick_uid(payload)
+    uid, uid_src = pick_uid(payload)
+    if not uid:
+        return {"scenario": scenario, "reply_text": "Техническая ошибка: не удалось определить пользователя. Напиши в поддержку."}
+
     ensure_user(uid)
 
     premium = get_premium_flag(payload)
@@ -358,8 +357,8 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
     with_file = with_file_requested and can_file
 
     logger.info(
-        "Scenario=%s uid=%s premium=%s trial_left=%s with_file_requested=%s with_file=%s",
-        scenario, uid, premium, trial_left, with_file_requested, with_file
+        "Scenario=%s uid=%s(uid_src=%s) premium=%s trial_left=%s with_file_requested=%s with_file=%s",
+        scenario, uid, uid_src, premium, trial_left, with_file_requested, with_file
     )
 
     try:
@@ -379,7 +378,6 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
             ).strip()
 
             draft = await call_groq(PROMPT_CONTRACT, user_text)
-
             result: Dict[str, str] = {"scenario": "contract", "reply_text": ""}
 
             if with_file:
@@ -391,26 +389,14 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                     consume_free(uid)
 
                 url = file_url_for(fn, request)
-
-                # Дублируем на всякий случай (BotHelp может ожидать другое имя поля)
                 result["file_url"] = url
-                result["pdf_url"] = url
-                result["download_url"] = url
-
-                # ВАЖНО: вставляем ссылку прямо в текст, чтобы файл “выдавался” даже без кнопки BotHelp
-                result["reply_text"] = (
-                    "Готово. Я подготовил черновик договора.\n\n"
-                    f"Скачать PDF: {url}"
-                )
-
-                logger.info("PDF URL=%s", url)
+                result["reply_text"] = f"Готово. Скачать PDF:\n{url}"
             else:
                 result["reply_text"] = draft
                 if with_file_requested and (not premium) and trial_left <= 0:
-                    result["reply_text"] = (
-                        draft
-                        + "\n\nPDF-документ доступен по подписке. "
-                          "Пробный PDF уже использован — оформи подписку, чтобы получать PDF без ограничений."
+                    result["reply_text"] += (
+                        "\n\nPDF-документ доступен по подписке. "
+                        "Пробный PDF уже использован — оформи подписку, чтобы получать PDF без ограничений."
                     )
 
             return result
@@ -433,7 +419,6 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
             ).strip()
 
             draft = await call_groq(PROMPT_CLAIM, user_text)
-
             result: Dict[str, str] = {"scenario": "claim", "reply_text": ""}
 
             if with_file:
@@ -445,24 +430,14 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                     consume_free(uid)
 
                 url = file_url_for(fn, request)
-
                 result["file_url"] = url
-                result["pdf_url"] = url
-                result["download_url"] = url
-
-                result["reply_text"] = (
-                    "Готово. Я подготовил черновик претензии.\n\n"
-                    f"Скачать PDF: {url}"
-                )
-
-                logger.info("PDF URL=%s", url)
+                result["reply_text"] = f"Готово. Скачать PDF:\n{url}"
             else:
                 result["reply_text"] = draft
                 if with_file_requested and (not premium) and trial_left <= 0:
-                    result["reply_text"] = (
-                        draft
-                        + "\n\nPDF-документ доступен по подписке. "
-                          "Пробный PDF уже использован — оформи подписку, чтобы получать PDF без ограничений."
+                    result["reply_text"] += (
+                        "\n\nPDF-документ доступен по подписке. "
+                        "Пробный PDF уже использован — оформи подписку, чтобы получать PDF без ограничений."
                     )
 
             return result
