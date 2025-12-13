@@ -26,14 +26,14 @@ if not logger.handlers:
 
 
 # ----------------- Конфиг -----------------
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")  # например https://legalfox.up.railway.app
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")  # напр. https://legalfox.up.railway.app
 FILES_DIR = os.getenv("FILES_DIR", "files")
 DB_PATH = os.getenv("DB_PATH", "legalfox.db")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
-# 1 бесплатный PDF на пользователя (как раньше)
+# 1 бесплатный PDF на пользователя
 FREE_PDF_LIMIT = int(os.getenv("FREE_PDF_LIMIT", "1"))  # оставь 1
 
 FALLBACK_TEXT = "Сейчас не могу обратиться к нейросети. Попробуй повторить чуть позже."
@@ -134,13 +134,6 @@ def safe_filename(prefix: str) -> str:
 
 
 def pick_uid(payload: Dict[str, Any]) -> str:
-    """
-    Стабильный ID пользователя:
-    - user_id (tg)
-    - bh_user_id (BotHelp)
-    - cuid (BotHelp)
-    - остальное как fallback
-    """
     for key in [
         "user_id",
         "tg_user_id",
@@ -180,10 +173,7 @@ def ensure_user(uid: str):
         return
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    cur.execute(
-        "INSERT OR IGNORE INTO users(uid, free_pdf_left) VALUES(?, ?)",
-        (uid, FREE_PDF_LIMIT),
-    )
+    cur.execute("INSERT OR IGNORE INTO users(uid, free_pdf_left) VALUES(?, ?)", (uid, FREE_PDF_LIMIT))
     con.commit()
     con.close()
 
@@ -197,9 +187,7 @@ def free_left(uid: str) -> int:
     cur.execute("SELECT free_pdf_left FROM users WHERE uid=?", (uid,))
     row = cur.fetchone()
     con.close()
-    if not row:
-        return 0
-    return int(row[0])
+    return int(row[0]) if row else 0
 
 
 def consume_free(uid: str):
@@ -239,7 +227,6 @@ def render_pdf(text: str, out_path: str, title: str):
 
     c.setFont(font_name, 14)
     c.drawString(left, height - top, title)
-
     c.setFont(font_name, 11)
 
     y = height - top - 30
@@ -308,7 +295,7 @@ async def call_groq(system_prompt: str, user_content: str) -> str:
 
 
 # ----------------- FastAPI -----------------
-app = FastAPI(title="LegalFox API", version="1.2.2")
+app = FastAPI(title="LegalFox API", version="1.2.3")
 
 os.makedirs(FILES_DIR, exist_ok=True)
 app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
@@ -346,7 +333,9 @@ def get_with_file_requested(payload: Dict[str, Any]) -> bool:
 
 
 def file_url_for(filename: str, request: Request) -> str:
-    # FIX: если PUBLIC_BASE_URL не задан, строим ссылку от домена запроса
+    # Всегда возвращаем публичный URL:
+    # 1) если PUBLIC_BASE_URL задан — берём его
+    # 2) иначе берём домен входящего запроса
     base = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
     return f"{base}/files/{filename}"
 
@@ -389,9 +378,6 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 f"Особые условия (как указано пользователем): {special or '___'}\n"
             ).strip()
 
-            if not user_text.strip():
-                return {"scenario": "contract", "reply_text": "Не вижу данных. Заполни поля и повтори."}
-
             draft = await call_groq(PROMPT_CONTRACT, user_text)
 
             result: Dict[str, str] = {"scenario": "contract", "reply_text": ""}
@@ -404,8 +390,20 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 if (not premium) and trial_left > 0:
                     consume_free(uid)
 
-                result["file_url"] = file_url_for(fn, request)
-                result["reply_text"] = "Готово. Я подготовил черновик договора — просто скачай PDF по кнопке ниже."
+                url = file_url_for(fn, request)
+
+                # Дублируем на всякий случай (BotHelp может ожидать другое имя поля)
+                result["file_url"] = url
+                result["pdf_url"] = url
+                result["download_url"] = url
+
+                # ВАЖНО: вставляем ссылку прямо в текст, чтобы файл “выдавался” даже без кнопки BotHelp
+                result["reply_text"] = (
+                    "Готово. Я подготовил черновик договора.\n\n"
+                    f"Скачать PDF: {url}"
+                )
+
+                logger.info("PDF URL=%s", url)
             else:
                 result["reply_text"] = draft
                 if with_file_requested and (not premium) and trial_left <= 0:
@@ -434,9 +432,6 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 f"Контакты: {contacts or '___'}\n"
             ).strip()
 
-            if not user_text.strip():
-                return {"scenario": "claim", "reply_text": "Не вижу данных. Заполни поля и повтори."}
-
             draft = await call_groq(PROMPT_CLAIM, user_text)
 
             result: Dict[str, str] = {"scenario": "claim", "reply_text": ""}
@@ -449,8 +444,18 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 if (not premium) and trial_left > 0:
                     consume_free(uid)
 
-                result["file_url"] = file_url_for(fn, request)
-                result["reply_text"] = "Готово. Я подготовил черновик претензии — просто скачай PDF по кнопке ниже."
+                url = file_url_for(fn, request)
+
+                result["file_url"] = url
+                result["pdf_url"] = url
+                result["download_url"] = url
+
+                result["reply_text"] = (
+                    "Готово. Я подготовил черновик претензии.\n\n"
+                    f"Скачать PDF: {url}"
+                )
+
+                logger.info("PDF URL=%s", url)
             else:
                 result["reply_text"] = draft
                 if with_file_requested and (not premium) and trial_left <= 0:
