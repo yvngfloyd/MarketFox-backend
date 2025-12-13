@@ -47,16 +47,21 @@ GIGACHAT_OAUTH_URL = os.getenv("GIGACHAT_OAUTH_URL", "https://ngw.devices.sberba
 GIGACHAT_BASE_URL = os.getenv("GIGACHAT_BASE_URL", "https://gigachat.devices.sberbank.ru")
 GIGACHAT_VERIFY_SSL = (os.getenv("GIGACHAT_VERIFY_SSL", "1").strip() != "0")
 
+
 def _safe_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)).strip())
     except Exception:
         return default
 
+
 FREE_PDF_LIMIT = max(0, _safe_int("FREE_PDF_LIMIT", 1))
 DEBUG_ERRORS = (os.getenv("DEBUG_ERRORS", "0").strip() == "1")
 
-# Ограничение текста в Telegram (чтобы BotHelp не падал на лимитах)
+# Всегда вставлять ссылку на PDF в reply_text (одной строкой)
+FORCE_PDF_LINK_IN_TEXT = (os.getenv("FORCE_PDF_LINK_IN_TEXT", "1").strip() != "0")
+
+# Ограничение текста в Telegram
 MAX_TEXT_PREVIEW = max(300, _safe_int("MAX_TEXT_PREVIEW", 1200))
 
 # PDF
@@ -127,6 +132,7 @@ PROMPT_CLAUSE = """
 # ----------------- Утилиты -----------------
 _PLACEHOLDER_RE = re.compile(r"^\s*\{\%.*\%\}\s*$")
 
+
 def _is_bad_value(v: Any) -> bool:
     if v is None:
         return True
@@ -140,6 +146,7 @@ def _is_bad_value(v: Any) -> bool:
         return True
     return False
 
+
 def _extract_digits(v: Any) -> str:
     if v is None:
         return ""
@@ -148,6 +155,7 @@ def _extract_digits(v: Any) -> str:
         return ""
     return re.sub(r"\D+", "", s)
 
+
 def normalize_bool(v: Any) -> bool:
     if v is None:
         return False
@@ -155,6 +163,7 @@ def normalize_bool(v: Any) -> bool:
         return v
     s = str(v).strip().lower()
     return s in ("1", "true", "yes", "y", "on")
+
 
 def strip_markdown_noise(text: str) -> str:
     if not text:
@@ -165,9 +174,11 @@ def strip_markdown_noise(text: str) -> str:
     text = re.sub(r"[ \t]+\n", "\n", text)
     return text.strip()
 
+
 def safe_filename(prefix: str) -> str:
     ts = time.strftime("%Y%m%d_%H%M%S")
     return f"{prefix}_{ts}_{uuid.uuid4().hex[:8]}.pdf"
+
 
 def pick_uid(payload: Dict[str, Any]) -> Tuple[str, str]:
     priority = [
@@ -193,6 +204,7 @@ def pick_uid(payload: Dict[str, Any]) -> Tuple[str, str]:
             return s, key
     return "", ""
 
+
 def extract_extra(payload: Dict[str, Any]) -> str:
     extra = (
         payload.get("Доп данные")
@@ -205,6 +217,7 @@ def extract_extra(payload: Dict[str, Any]) -> str:
     )
     return str(extra).strip()
 
+
 def scenario_alias(s: str) -> str:
     s = (s or "").strip().lower()
     if s in ("draft_contract", "contract", "договора", "договора_черновик"):
@@ -215,25 +228,34 @@ def scenario_alias(s: str) -> str:
         return "clause"
     return "contract"
 
+
 def get_premium_flag(payload: Dict[str, Any]) -> bool:
     for key in ["Premium", "premium", "PREMIUM", "is_premium", "Подписка"]:
         if key in payload:
             return normalize_bool(payload.get(key))
     return False
 
+
 def get_with_file_requested(payload: Dict[str, Any], scenario: str) -> bool:
+    # Если with_file не прислали — считаем, что для contract/claim файл запрошен
     if "with_file" in payload:
         return normalize_bool(payload.get("with_file"))
     return scenario in ("contract", "claim")
 
-def make_file_fields(url: str) -> Dict[str, str]:
+
+def make_file_fields(url: str, filename: str = "") -> Dict[str, str]:
     u = url or ""
     return {
         "file_url": u,
         "pdf_url": u,
         "file": u,
         "document_url": u,
+        "attachment_url": u,
+        "has_file": "1" if u else "0",
+        "file_name": filename or "",
+        "file_mime": "application/pdf" if u else "",
     }
+
 
 def make_error_response(scenario: str, err: Optional[Exception] = None) -> Dict[str, str]:
     msg = FALLBACK_TEXT
@@ -243,8 +265,11 @@ def make_error_response(scenario: str, err: Optional[Exception] = None) -> Dict[
     resp.update(make_file_fields(""))
     return resp
 
-def build_pdf_reply(base_text: str, comment: str) -> str:
-    txt = base_text.strip()
+
+def build_pdf_reply(base_text: str, comment: str, url: str) -> str:
+    txt = (base_text or "").strip()
+    if FORCE_PDF_LINK_IN_TEXT and url:
+        txt += f"\n\nСкачать PDF: {url}"
     if comment:
         txt += f"\n\nКомментарий по твоему кейсу:\n{comment.strip()}"
     return txt
@@ -257,6 +282,7 @@ def _db_connect():
     cur.execute("PRAGMA journal_mode=WAL;")
     cur.execute("PRAGMA synchronous=NORMAL;")
     return con
+
 
 def db_init():
     con = _db_connect()
@@ -272,6 +298,7 @@ def db_init():
     con.commit()
     con.close()
 
+
 def ensure_user(uid: str):
     if not uid:
         return
@@ -280,6 +307,7 @@ def ensure_user(uid: str):
     cur.execute("INSERT OR IGNORE INTO users(uid, free_pdf_left) VALUES(?, ?)", (uid, FREE_PDF_LIMIT))
     con.commit()
     con.close()
+
 
 def free_left(uid: str) -> int:
     if not uid:
@@ -291,6 +319,7 @@ def free_left(uid: str) -> int:
     row = cur.fetchone()
     con.close()
     return int(row[0]) if row else 0
+
 
 def consume_free(uid: str) -> bool:
     if not uid:
@@ -314,15 +343,18 @@ def _read_text(path: str) -> str:
     except Exception:
         return ""
 
+
 def load_template(name: str) -> str:
     path = os.path.join(TEMPLATES_DIR, name)
     return _read_text(path)
+
 
 def expand_contract_template(template_text: str) -> str:
     tail = load_template("common_contract_tail_8_12.txt")
     if not tail:
         return template_text
     return template_text.replace("{{COMMON_CONTRACT_TAIL}}", tail.strip())
+
 
 def detect_contract_variant(payload: Dict[str, Any]) -> str:
     explicit = payload.get("doc_type") or payload.get("document_type") or payload.get("variant")
@@ -343,6 +375,7 @@ def detect_contract_variant(payload: Dict[str, Any]) -> str:
     if "услуг" in t or "консульт" in t or "smm" in t or "дизайн" in t:
         return "services"
     return "services"
+
 
 def contract_template_name(variant: str) -> str:
     return {
@@ -375,15 +408,18 @@ def register_fonts():
         except Exception:
             logger.exception("Font register failed: %s", family)
 
+
 def pick_font_family() -> str:
     register_fonts()
     if PDF_FONT_FAMILY in pdfmetrics.getRegisteredFontNames():
         return PDF_FONT_FAMILY
     return "Helvetica"
 
+
 def pick_bold_font(family: str) -> str:
     bold = family + "-Bold"
     return bold if bold in pdfmetrics.getRegisteredFontNames() else family
+
 
 def render_pdf(text: str, out_path: str, title: str):
     family = pick_font_family()
@@ -428,16 +464,21 @@ def render_pdf(text: str, out_path: str, title: str):
     doc.build(story)
 
 
-# ----------------- HTTP client (keep-alive) + retries -----------------
+# ----------------- HTTP client + retries -----------------
 _http_client: Optional[httpx.AsyncClient] = None
+
 
 def _http_timeout() -> httpx.Timeout:
     return httpx.Timeout(connect=15.0, read=180.0, write=30.0, pool=30.0)
 
+
 def _http_limits() -> httpx.Limits:
     return httpx.Limits(max_connections=20, max_keepalive_connections=10, keepalive_expiry=30.0)
 
-async def _post_with_retries(url: str, *, headers: Dict[str, str], json: Any = None, data: Any = None, attempts: int = 3) -> httpx.Response:
+
+async def _post_with_retries(
+    url: str, *, headers: Dict[str, str], json: Any = None, data: Any = None, attempts: int = 3
+) -> httpx.Response:
     last_err: Optional[Exception] = None
     for i in range(attempts):
         try:
@@ -456,8 +497,10 @@ _token_lock = asyncio.Lock()
 _token_value: Optional[str] = None
 _token_exp: float = 0.0
 
+
 def _now() -> float:
     return time.time()
+
 
 async def get_gigachat_access_token() -> str:
     global _token_value, _token_exp
@@ -493,6 +536,7 @@ async def get_gigachat_access_token() -> str:
         _token_exp = _now() + 25 * 60
         logger.info("GigaChat token refreshed rq_uid=%s", rq_uid)
         return _token_value
+
 
 async def call_gigachat(system_prompt: str, user_content: str, max_tokens: int = 1400) -> str:
     token = await get_gigachat_access_token()
@@ -536,6 +580,7 @@ async def call_gigachat(system_prompt: str, user_content: str, max_tokens: int =
 
     return strip_markdown_noise(content)
 
+
 async def call_llm(system_prompt: str, user_input: str, max_tokens: int = 1400) -> str:
     if LLM_PROVIDER != "gigachat":
         raise RuntimeError("LLM_PROVIDER must be gigachat")
@@ -543,7 +588,7 @@ async def call_llm(system_prompt: str, user_input: str, max_tokens: int = 1400) 
 
 
 # ----------------- FastAPI -----------------
-app = FastAPI(title="LegalFox API", version="3.2.0-no-resend")
+app = FastAPI(title="LegalFox API", version="3.3.0-link-safe")
 
 os.makedirs(FILES_DIR, exist_ok=True)
 app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
@@ -552,11 +597,13 @@ db_init()
 if not PUBLIC_BASE_URL:
     logger.warning("PUBLIC_BASE_URL is empty. Set it in Railway to avoid bad links.")
 
+
 @app.on_event("startup")
 async def _startup_http():
     global _http_client
     if _http_client is None:
         _http_client = httpx.AsyncClient(timeout=_http_timeout(), limits=_http_limits(), verify=GIGACHAT_VERIFY_SSL)
+
 
 @app.on_event("shutdown")
 async def _shutdown_http():
@@ -564,6 +611,7 @@ async def _shutdown_http():
     if _http_client is not None:
         await _http_client.aclose()
         _http_client = None
+
 
 @app.get("/")
 async def root():
@@ -575,7 +623,9 @@ async def root():
         "templates_dir": TEMPLATES_DIR,
         "model": GIGACHAT_MODEL,
         "verify_ssl": bool(GIGACHAT_VERIFY_SSL),
+        "force_pdf_link_in_text": bool(FORCE_PDF_LINK_IN_TEXT),
     }
+
 
 def file_url_for(filename: str, request: Request) -> str:
     if PUBLIC_BASE_URL:
@@ -679,7 +729,6 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 + user_data
             )
 
-            # Важно: если LLM упал — не выдаём файл и не списываем trial
             draft = await call_llm(PROMPT_DRAFT_WITH_TEMPLATE, llm_user_msg, max_tokens=1500)
 
             comment = ""
@@ -703,20 +752,21 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                     resp.update(make_file_fields(""))
                     return resp
 
+                # trial списываем только после успешного URL
                 if (not premium) and trial_left > 0:
                     consume_free(uid)
 
                 reply_text = build_pdf_reply(
-                    base_text="Готово. Я подготовил черновик договора и прикрепил PDF ниже.",
+                    base_text="Готово. Я подготовил черновик договора.",
                     comment=comment,
+                    url=url,
                 )
 
                 resp = {"scenario": "contract", "reply_text": reply_text}
-                resp.update(make_file_fields(url))
+                resp.update(make_file_fields(url, fn))
                 logger.info("RETURN contract url=%s", url)
                 return resp
 
-            # без PDF — режем текст, чтобы не ломалось в Telegram
             upsell = ""
             if with_file_requested and (not premium) and trial_left <= 0:
                 upsell = "\n\nПробный PDF уже использован. Оформи подписку, чтобы получать PDF без ограничений."
@@ -792,12 +842,13 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                     consume_free(uid)
 
                 reply_text = build_pdf_reply(
-                    base_text="Готово. Я подготовил черновик претензии и прикрепил PDF ниже.",
+                    base_text="Готово. Я подготовил черновик претензии.",
                     comment=comment,
+                    url=url,
                 )
 
                 resp = {"scenario": "claim", "reply_text": reply_text}
-                resp.update(make_file_fields(url))
+                resp.update(make_file_fields(url, fn))
                 logger.info("RETURN claim url=%s", url)
                 return resp
 
