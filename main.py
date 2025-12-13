@@ -70,8 +70,8 @@ PDF_RIGHT_MM = float(os.getenv("PDF_RIGHT_MM", "15"))
 PDF_TOP_MM = float(os.getenv("PDF_TOP_MM", "20"))
 PDF_BOTTOM_MM = float(os.getenv("PDF_BOTTOM_MM", "20"))
 
-# Чтобы PDF доходил даже если BotHelp не прикрепляет — ссылка в тексте
-ALWAYS_INCLUDE_LINK_IN_TEXT = (os.getenv("ALWAYS_INCLUDE_LINK_IN_TEXT", "1").strip() == "1")
+# ВАЖНО: чтобы не было дублей ссылок — по умолчанию НЕ вставляем URL в текст
+ALWAYS_INCLUDE_LINK_IN_TEXT = (os.getenv("ALWAYS_INCLUDE_LINK_IN_TEXT", "0").strip() == "1")
 
 FALLBACK_TEXT = "Сейчас не могу обратиться к нейросети. Попробуй повторить чуть позже."
 URL_ERROR_TEXT = "Техническая ошибка: не удалось сформировать публичную ссылку на PDF. Проверь PUBLIC_BASE_URL."
@@ -80,7 +80,6 @@ NO_TEMPLATE_TEXT = "Техническая ошибка: не найден ша�
 
 
 # ----------------- Промты -----------------
-# Важно: шаблон даём как «обязательный скелет», чтобы структура была «как в реальном документе»
 PROMPT_DRAFT_WITH_TEMPLATE = """
 Ты — LegalFox, помощник по подготовке юридических черновиков по праву РФ.
 
@@ -96,10 +95,13 @@ PROMPT_DRAFT_WITH_TEMPLATE = """
 Ниже будет ШАБЛОН и ДАННЫЕ ПОЛЬЗОВАТЕЛЯ.
 """
 
+# Комментарии — всегда на "ты"
 PROMPT_CONTRACT_COMMENT = """
 Ты — LegalFox. Дай краткий комментарий по договору (6–10 строк).
+
 Строго:
 - Без Markdown.
+- Обращайся к пользователю на "ты" (тебе/твой/тебя).
 - Не задавай вопросы.
 - Не используй символ '?'.
 - Пиши инструкциями: "Проверь...", "Укажи...", "Добавь...", "Закрепи...".
@@ -107,16 +109,19 @@ PROMPT_CONTRACT_COMMENT = """
 
 PROMPT_CLAIM_COMMENT = """
 Ты — LegalFox. Дай краткий комментарий по претензии (6–12 строк).
+
 Строго:
 - Без Markdown.
+- Обращайся к пользователю на "ты" (тебе/твой/тебя).
 - Не задавай вопросы.
 - Не используй символ '?'.
 - Пиши инструкциями.
-- В конце отдельная строка: "Приложите копии: ...".
+- В конце отдельная строка: "Приложи копии: ...".
 """
 
 PROMPT_CLAUSE = """
 Ты — LegalFox. Ответь по-русски, по делу, без Markdown. Короткие абзацы.
+Обращайся к пользователю на "ты".
 """
 
 
@@ -220,7 +225,6 @@ def get_premium_flag(payload: Dict[str, Any]) -> bool:
 def get_with_file_requested(payload: Dict[str, Any], scenario: str) -> bool:
     if "with_file" in payload:
         return normalize_bool(payload.get("with_file"))
-    # Без изменений BotHelp: для contract/claim считаем, что файл нужен (trial сможет сработать)
     if scenario in ("contract", "claim"):
         return True
     return get_premium_flag(payload)
@@ -303,12 +307,10 @@ def load_template(name: str) -> str:
 def expand_contract_template(template_text: str) -> str:
     tail = load_template("common_contract_tail_8_12.txt")
     if not tail:
-        # если хвоста нет — просто вернём как есть
         return template_text
     return template_text.replace("{{COMMON_CONTRACT_TAIL}}", tail.strip())
 
 def detect_contract_variant(payload: Dict[str, Any]) -> str:
-    # если ты захочешь явно передавать doc_type из BotHelp — поддержим
     explicit = payload.get("doc_type") or payload.get("document_type") or payload.get("variant")
     if explicit and not _is_bad_value(explicit):
         v = str(explicit).strip().lower()
@@ -316,12 +318,11 @@ def detect_contract_variant(payload: Dict[str, Any]) -> str:
             return v
 
     t = (payload.get("Тип договора") or payload.get("Тип_договора") or "").strip().lower()
-    # эвристики
     if "аренд" in t or "квартир" in t or "офис" in t or "оборуд" in t:
         return "lease"
     if "подряд" in t or "ремонт" in t or "стро" in t or "изготов" in t:
         return "podryad"
-    if "постав" in t or "поставка" in t:
+    if "постав" in t:
         return "supply"
     if "купл" in t or "продаж" in t:
         return "sale"
@@ -507,7 +508,7 @@ async def call_llm(system_prompt: str, user_input: str, max_tokens: int = 1400) 
 
 
 # ----------------- FastAPI -----------------
-app = FastAPI(title="LegalFox API", version="2.0.0-templates")
+app = FastAPI(title="LegalFox API", version="2.0.1-templates-ty")
 
 os.makedirs(FILES_DIR, exist_ok=True)
 app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
@@ -551,7 +552,8 @@ def file_url_for(filename: str, request: Request) -> str:
 def build_pdf_reply(base_text: str, comment: str, url: str) -> str:
     txt = base_text
     if comment:
-        txt += f"\n\nКомментарий по вашему кейсу:\n{comment}"
+        txt += f"\n\nКомментарий по твоему кейсу:\n{comment}"
+    # По умолчанию НЕ добавляем ссылку в текст, чтобы не было дублей.
     if ALWAYS_INCLUDE_LINK_IN_TEXT and url:
         txt += f"\n\nСкачать PDF:\n{url}"
     return txt
@@ -591,7 +593,6 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
 
             template_text = expand_contract_template(raw_tpl)
             if "{{COMMON_CONTRACT_TAIL}}" in template_text:
-                # хвост не подставился — значит нет common файла
                 return {"scenario": "contract", "reply_text": NO_TEMPLATE_TEXT, "file_url": "", "pdf_url": "", "file": "", "document_url": ""}
 
             contract_type = payload.get("Тип договора") or payload.get("Тип_договора") or ""
@@ -611,7 +612,6 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 f"Выбранный вариант шаблона: {variant}\n"
             ).strip()
 
-            # Один вызов на черновик по шаблону
             llm_user_msg = (
                 "ШАБЛОН (строго следовать):\n"
                 + template_text.strip()
@@ -644,18 +644,19 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                     consume_free(uid)
 
                 reply_text = build_pdf_reply(
-                    base_text="Готово. Я подготовил черновик договора по выбранному шаблону и сформировал PDF-файл.",
+                    base_text="Готово. Я подготовил черновик договора по выбранному шаблону и прикрепил PDF-файл ниже.",
                     comment=comment,
                     url=url,
                 )
 
+                # ВАЖНО: чтобы BotHelp не дублировал URL — заполняем только file_url.
                 return {
                     "scenario": "contract",
                     "reply_text": reply_text,
                     "file_url": url,
-                    "pdf_url": url,
-                    "file": url,
-                    "document_url": url,
+                    "pdf_url": "",
+                    "file": "",
+                    "document_url": "",
                 }
 
             txt = draft + (f"\n\nКомментарий:\n{comment}" if comment else "")
@@ -722,7 +723,7 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                     consume_free(uid)
 
                 reply_text = build_pdf_reply(
-                    base_text="Готово. Я подготовил черновик претензии по шаблону и сформировал PDF-файл.",
+                    base_text="Готово. Я подготовил черновик претензии по шаблону и прикрепил PDF-файл ниже.",
                     comment=comment,
                     url=url,
                 )
@@ -731,9 +732,9 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                     "scenario": "claim",
                     "reply_text": reply_text,
                     "file_url": url,
-                    "pdf_url": url,
-                    "file": url,
-                    "document_url": url,
+                    "pdf_url": "",
+                    "file": "",
+                    "document_url": "",
                 }
 
             txt = draft + (f"\n\nКомментарий:\n{comment}" if comment else "")
