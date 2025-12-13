@@ -7,7 +7,7 @@ import logging
 from typing import Any, Dict
 
 import httpx
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body, Request
 from fastapi.staticfiles import StaticFiles
 
 from reportlab.lib.pagesizes import A4
@@ -26,14 +26,14 @@ if not logger.handlers:
 
 
 # ----------------- Конфиг -----------------
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")  # например https://xxx.up.railway.app
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")  # например https://legalfox.up.railway.app
 FILES_DIR = os.getenv("FILES_DIR", "files")
 DB_PATH = os.getenv("DB_PATH", "legalfox.db")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
-# 1 бесплатный PDF на пользователя
+# 1 бесплатный PDF на пользователя (как раньше)
 FREE_PDF_LIMIT = int(os.getenv("FREE_PDF_LIMIT", "1"))  # оставь 1
 
 FALLBACK_TEXT = "Сейчас не могу обратиться к нейросети. Попробуй повторить чуть позже."
@@ -120,15 +120,10 @@ def normalize_bool(v: Any) -> bool:
 def strip_markdown_noise(text: str) -> str:
     if not text:
         return ""
-    # удалить блоки ```...```
     text = re.sub(r"```.*?```", "", text, flags=re.S)
-    # убрать одиночные бэктики
     text = text.replace("`", "")
-    # убрать жирность/подчёркивания
     text = text.replace("**", "").replace("__", "")
-    # убрать маркдауны заголовков
     text = re.sub(r"^\s*#+\s*", "", text, flags=re.M)
-    # подчистить хвостовые пробелы
     text = re.sub(r"[ \t]+\n", "\n", text)
     return text.strip()
 
@@ -140,8 +135,11 @@ def safe_filename(prefix: str) -> str:
 
 def pick_uid(payload: Dict[str, Any]) -> str:
     """
-    Стабильный ID пользователя (лучше всего telegram user_id).
-    + подстрахуем BotHelp макросами: bh_user_id / cuid
+    Стабильный ID пользователя:
+    - user_id (tg)
+    - bh_user_id (BotHelp)
+    - cuid (BotHelp)
+    - остальное как fallback
     """
     for key in [
         "user_id",
@@ -221,10 +219,6 @@ def consume_free(uid: str):
 
 # ----------------- PDF (кириллица) -----------------
 def ensure_font_name() -> str:
-    """
-    Чтобы кириллица выглядела нормально — добавь файл:
-      fonts/DejaVuSans.ttf
-    """
     try:
         font_path = os.path.join("fonts", "DejaVuSans.ttf")
         if os.path.exists(font_path):
@@ -287,7 +281,7 @@ def render_pdf(text: str, out_path: str, title: str):
     c.save()
 
 
-# ----------------- LLM (Groq через OpenAI-compatible endpoint) -----------------
+# ----------------- LLM (Groq) -----------------
 async def call_groq(system_prompt: str, user_content: str) -> str:
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY not set")
@@ -300,7 +294,7 @@ async def call_groq(system_prompt: str, user_content: str) -> str:
             {"role": "system", "content": system_prompt.strip()},
             {"role": "user", "content": user_content.strip()},
         ],
-        "temperature": 0.25,   # меньше "креатива" — больше шаблонности и точности
+        "temperature": 0.25,
         "max_tokens": 1400,
         "top_p": 1,
     }
@@ -314,15 +308,12 @@ async def call_groq(system_prompt: str, user_content: str) -> str:
 
 
 # ----------------- FastAPI -----------------
-app = FastAPI(title="LegalFox API", version="1.2.1")
+app = FastAPI(title="LegalFox API", version="1.2.2")
 
 os.makedirs(FILES_DIR, exist_ok=True)
 app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
 
 db_init()
-
-if not PUBLIC_BASE_URL:
-    logger.warning("PUBLIC_BASE_URL не задан — file_url может быть некорректным. Задай PUBLIC_BASE_URL в Railway.")
 
 
 @app.get("/")
@@ -332,22 +323,16 @@ async def root():
 
 def scenario_alias(s: str) -> str:
     s = (s or "").strip().lower()
-    # поддержка старых вариантов
     if s in ("draft_contract", "contract", "договора", "договора_черновик"):
         return "contract"
     if s in ("draft_claim", "claim", "претензия", "претензии"):
         return "claim"
     if s in ("clause", "ask", "help", "пункты", "правки"):
         return "clause"
-    # дефолт
     return "contract"
 
 
 def get_premium_flag(payload: Dict[str, Any]) -> bool:
-    """
-    Premium приходит из BotHelp как поле 1/0.
-    Поддержим разные варианты ключа.
-    """
     for key in ["Premium", "premium", "PREMIUM", "is_premium", "Подписка"]:
         if key in payload:
             return normalize_bool(payload.get(key))
@@ -355,25 +340,19 @@ def get_premium_flag(payload: Dict[str, Any]) -> bool:
 
 
 def get_with_file_requested(payload: Dict[str, Any]) -> bool:
-    """
-    Ты обычно шлёшь with_file = 1.
-    Поддержим:
-      - with_file
-      - Premium (как fallback)
-    """
     if "with_file" in payload:
         return normalize_bool(payload.get("with_file"))
     return get_premium_flag(payload)
 
 
-def file_url_for(filename: str) -> str:
-    if not PUBLIC_BASE_URL:
-        return ""
-    return f"{PUBLIC_BASE_URL}/files/{filename}"
+def file_url_for(filename: str, request: Request) -> str:
+    # FIX: если PUBLIC_BASE_URL не задан, строим ссылку от домена запроса
+    base = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
+    return f"{base}/files/{filename}"
 
 
 @app.post("/legalfox")
-async def legalfox(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
+async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
     logger.info("Incoming payload keys: %s", list(payload.keys()))
 
     scenario_raw = payload.get("scenario") or payload.get("Сценарий") or payload.get("сценарий") or "contract"
@@ -385,14 +364,13 @@ async def legalfox(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
     premium = get_premium_flag(payload)
     with_file_requested = get_with_file_requested(payload)
 
-    # 1 бесплатный PDF: разрешаем файл, если premium или есть trial
     trial_left = free_left(uid)
     can_file = premium or (trial_left > 0)
     with_file = with_file_requested and can_file
 
     logger.info(
-        "Scenario=%s uid=%s premium=%s trial_left=%s with_file=%s",
-        scenario, uid, premium, trial_left, with_file
+        "Scenario=%s uid=%s premium=%s trial_left=%s with_file_requested=%s with_file=%s",
+        scenario, uid, premium, trial_left, with_file_requested, with_file
     )
 
     try:
@@ -403,7 +381,6 @@ async def legalfox(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
             terms_pay = payload.get("Сроки и оплата") or payload.get("Сроки_и_оплата") or payload.get("Сроки") or ""
             special = payload.get("Особые условия") or payload.get("Особые_условия") or ""
 
-            # делаем ввод максимально "явным" для модели
             user_text = (
                 f"Тип договора: {contract_type or '___'}\n"
                 f"Стороны (как указано пользователем): {parties or '___'}\n"
@@ -423,22 +400,14 @@ async def legalfox(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
                 fn = safe_filename("contract")
                 out_path = os.path.join(FILES_DIR, fn)
                 render_pdf(draft, out_path, title="ДОГОВОР (ЧЕРНОВИК)")
-                logger.info("PDF создан: %s", out_path)
 
-                # если это был trial — списываем
                 if (not premium) and trial_left > 0:
                     consume_free(uid)
 
-                url = file_url_for(fn)
-                if url:
-                    result["file_url"] = url
-
-                # короткий ответ вместо простыни
+                result["file_url"] = file_url_for(fn, request)
                 result["reply_text"] = "Готово. Я подготовил черновик договора — просто скачай PDF по кнопке ниже."
             else:
-                # если PDF не доступен — оставляем текст в чате
                 result["reply_text"] = draft
-
                 if with_file_requested and (not premium) and trial_left <= 0:
                     result["reply_text"] = (
                         draft
@@ -476,15 +445,11 @@ async def legalfox(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
                 fn = safe_filename("claim")
                 out_path = os.path.join(FILES_DIR, fn)
                 render_pdf(draft, out_path, title="ПРЕТЕНЗИЯ (ЧЕРНОВИК)")
-                logger.info("PDF создан: %s", out_path)
 
                 if (not premium) and trial_left > 0:
                     consume_free(uid)
 
-                url = file_url_for(fn)
-                if url:
-                    result["file_url"] = url
-
+                result["file_url"] = file_url_for(fn, request)
                 result["reply_text"] = "Готово. Я подготовил черновик претензии — просто скачай PDF по кнопке ниже."
             else:
                 result["reply_text"] = draft
@@ -497,7 +462,7 @@ async def legalfox(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
 
             return result
 
-        # scenario == "clause"
+        # clause
         q = payload.get("Запрос") or payload.get("query") or payload.get("Вопрос") or payload.get("Текст") or ""
         q = str(q).strip()
         if not q:
