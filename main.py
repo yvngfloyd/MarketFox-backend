@@ -26,21 +26,21 @@ if not logger.handlers:
 
 
 # ----------------- Конфиг -----------------
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")  # например https://xxx.up.railway.app
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")  # например https://legalfox.up.railway.app
 FILES_DIR = os.getenv("FILES_DIR", "files")
 DB_PATH = os.getenv("DB_PATH", "legalfox.db")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
-# ВАЖНО: не даём FREE_PDF_LIMIT стать 0 из env
+# FREE_PDF_LIMIT: не даём стать 0 (чтобы trial не "сломался" из env)
 _FREE_ENV = os.getenv("FREE_PDF_LIMIT", "1")
 try:
     FREE_PDF_LIMIT = max(1, int(_FREE_ENV))
 except Exception:
     FREE_PDF_LIMIT = 1
 
-# Админ-токен для сброса тестового пользователя
+# Админ токен для сброса trial (задай в Railway Variables)
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
 FALLBACK_TEXT = "Сейчас не могу обратиться к нейросети. Попробуй повторить чуть позже."
@@ -48,25 +48,60 @@ FALLBACK_TEXT = "Сейчас не могу обратиться к нейрос
 
 # ----------------- Промты -----------------
 PROMPT_CONTRACT = """
-Ты — LegalFox, помощник для обычных людей (не юристов). Твоя задача — подготовить аккуратный ЧЕРНОВИК договора.
+Ты — LegalFox, помощник по подготовке черновиков договоров по праву РФ.
+Сгенерируй ЧЕРНОВИК ДОГОВОРА для печати (официально-деловой стиль).
 
-Строго:
-- Без Markdown: никаких **, #, ``` и т.п.
-- Официальный стиль, но понятный человеку.
-- Не выдумывай паспортные/адресные данные: если их нет, оставляй как "___".
-- Структура должна быть похожа на реальный документ: шапка, предмет, права/обязанности, цена/оплата, сроки, ответственность, форс-мажор, порядок расторжения, реквизиты/подписи.
-- Пиши с пустыми строками между разделами (чтобы выглядело как документ).
+Жёсткие правила (обязательно):
+1) Без Markdown: никаких #, **, ``` и т.п.
+2) Не используй заглушки вида "СТОРОНА_1", "АДРЕС_1", "ПРЕДМЕТ" и т.п.
+   Вместо этого:
+   - если данных нет — ставь "___"
+   - если данные есть — вставляй их как есть, без кавычек.
+3) Ничего не выдумывай: паспорт, ИНН, ОГРН, адреса, реквизиты, суммы, сроки — только если они есть во вводе.
+   Если нет — "___".
+4) Максимально конкретно используй входные данные: тип договора, стороны, предмет, сроки, оплата, особые условия.
+5) Пиши как реальный документ РФ:
+   - Название сверху: "ДОГОВОР <тип договора>" (если тип договора не указан — "ДОГОВОР")
+   - Город: ___   Дата: ___  (если не указаны во вводе)
+   - Разделы с нумерацией: 1. Предмет договора, 2. Права и обязанности, 3. Цена и порядок расчётов,
+     4. Сроки, 5. Ответственность сторон, 6. Форс-мажор, 7. Порядок разрешения споров,
+     8. Срок действия и расторжение, 9. Заключительные положения, 10. Реквизиты и подписи.
+6) Форс-мажор: корректная формулировка ("чрезвычайные и непредотвратимые обстоятельства") без странных примеров,
+   если пользователь сам их не указал.
+7) Суммы/сроки:
+   - если сумма/срок не указаны — оставь понятное место: "___ рублей", "___ календарных дней"
+   - не пиши случайные числа.
+8) Если "особые условия" содержат важные пункты (штрафы, порядок передачи, конфиденциальность, подсудность и т.д.) —
+   встрои их в соответствующие разделы.
+9) В конце:
+   - "Реквизиты и подписи сторон" с аккуратными полями.
+   - Для физлиц: ФИО, паспорт: ___, адрес: ___, телефон/email: ___
+   - Для юрлиц/ИП: наименование, ИНН/ОГРН(ОГРНИП): ___, адрес, р/с, банк, БИК, к/с: ___
+   Определи тип стороны по входным данным (если явно написано ООО/ИП — используй соответствующий блок).
+   Если непонятно — сделай универсально: "ФИО/Наименование: ___".
+10) Документ должен быть пригоден как черновик и выглядеть аккуратно: короткие абзацы, пустые строки между разделами.
 """
 
 PROMPT_CLAIM = """
-Ты — LegalFox, помощник для обычных людей. Подготовь ЧЕРНОВИК ПРЕТЕНЗИИ (досудебной).
+Ты — LegalFox, помощник по подготовке претензий по праву РФ (для обычных людей).
+Сгенерируй ЧЕРНОВИК ПРЕТЕНЗИИ (досудебной) в официально-деловом стиле.
 
-Строго:
-- Без Markdown.
-- Официальный стиль.
-- Структура: "Кому/От кого", заголовок "ПРЕТЕНЗИЯ", обстоятельства, основания, требования, срок исполнения, приложения (если уместно), дата/подпись/контакты.
-- Не выдумывай конкретные реквизиты, если их нет — ставь "___".
-- Делай читаемо: разделы и пустые строки.
+Жёсткие правила (обязательно):
+1) Без Markdown.
+2) Не используй заглушки вида "СТОРОНА_1", "АДРЕС_1", "СУММА_1" и т.п.
+   Если данных нет — "___". Если есть — вставляй как есть, без кавычек.
+3) Ничего не выдумывай: даты, суммы, реквизиты, нормы закона — только если пользователь дал их явно.
+   Если не дал — оставь "___" или нейтральную формулировку без ссылок на конкретные статьи.
+4) Структура:
+   - Кому: ___
+   - От кого: ___
+   - Заголовок: "ПРЕТЕНЗИЯ"
+   - Описание обстоятельств (кратко, по делу)
+   - Требования (конкретно)
+   - Срок исполнения требований: ___ дней (если не указан)
+   - Приложения (если уместно)
+   - Дата/подпись/контакты
+5) Текст должен выглядеть как документ: абзацы, пустые строки между блоками.
 """
 
 PROMPT_CLAUSE = """
@@ -107,15 +142,20 @@ def safe_filename(prefix: str) -> str:
 
 def pick_uid(payload: Dict[str, Any]) -> str:
     """
-    Делаем UID максимально стабильным:
+    UID максимально стабильный:
     1) Telegram user_id
     2) BotHelp subscriber id (bh_user_id)
     3) cuid
     4) другие варианты
     """
     keys = [
-        "user_id", "tg_user_id", "telegram_user_id", "messenger_user_id",
-        "bh_user_id", "bothelp_user_id", "cuid"
+        "user_id",
+        "tg_user_id",
+        "telegram_user_id",
+        "messenger_user_id",
+        "bh_user_id",
+        "bothelp_user_id",
+        "cuid",
     ]
     for key in keys:
         v = payload.get(key)
@@ -123,7 +163,6 @@ def pick_uid(payload: Dict[str, Any]) -> str:
             continue
         v = str(v).strip()
         if v:
-            # нормализуем, чтобы в БД не было "tg:..." разных форматов
             return v
     return ""
 
@@ -286,8 +325,8 @@ async def call_groq(system_prompt: str, user_content: str) -> str:
             {"role": "system", "content": system_prompt.strip()},
             {"role": "user", "content": user_content.strip()},
         ],
-        "temperature": 0.35,
-        "max_tokens": 1200,
+        "temperature": 0.25,   # ниже — меньше "креатива"
+        "max_tokens": 1400,
         "top_p": 1,
     }
 
@@ -300,7 +339,7 @@ async def call_groq(system_prompt: str, user_content: str) -> str:
 
 
 # ----------------- FastAPI -----------------
-app = FastAPI(title="LegalFox API", version="1.2.0")
+app = FastAPI(title="LegalFox API", version="1.3.0")
 
 os.makedirs(FILES_DIR, exist_ok=True)
 app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
@@ -308,7 +347,6 @@ app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
 db_init()
 
 logger.info("BOOT: DB_PATH=%s FREE_PDF_LIMIT=%s PUBLIC_BASE_URL=%s", DB_PATH, FREE_PDF_LIMIT, PUBLIC_BASE_URL)
-
 if not PUBLIC_BASE_URL:
     logger.warning("PUBLIC_BASE_URL не задан — file_url может быть некорректным. Задай PUBLIC_BASE_URL в Railway.")
 
@@ -348,7 +386,7 @@ def file_url_for(filename: str) -> str:
     return f"{PUBLIC_BASE_URL}/files/{filename}"
 
 
-# --------- Админ: сброс trial / посмотреть состояние ---------
+# ----------------- Админ: сброс trial / состояние -----------------
 @app.post("/admin/reset_trial")
 async def admin_reset_trial(
     payload: Dict[str, Any] = Body(...),
@@ -359,11 +397,25 @@ async def admin_reset_trial(
 
     uid = str(payload.get("uid", "")).strip()
     value = payload.get("value", FREE_PDF_LIMIT)
-
     if not uid:
         raise HTTPException(status_code=400, detail="uid required")
 
     reset_free(uid, int(value))
+    return {"ok": True, "uid": uid, "free_pdf_left": free_left(uid)}
+
+
+@app.post("/admin/state")
+async def admin_state(
+    payload: Dict[str, Any] = Body(...),
+    x_admin_token: Optional[str] = Header(default=None),
+):
+    if not ADMIN_TOKEN or x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    uid = str(payload.get("uid", "")).strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="uid required")
+
     return {"ok": True, "uid": uid, "free_pdf_left": free_left(uid)}
 
 
@@ -383,21 +435,6 @@ async def admin_delete_user(
     return {"ok": True, "uid": uid}
 
 
-@app.post("/admin/state")
-async def admin_state(
-    payload: Dict[str, Any] = Body(...),
-    x_admin_token: Optional[str] = Header(default=None),
-):
-    if not ADMIN_TOKEN or x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=401, detail="unauthorized")
-
-    uid = str(payload.get("uid", "")).strip()
-    if not uid:
-        raise HTTPException(status_code=400, detail="uid required")
-
-    return {"ok": True, "uid": uid, "free_pdf_left": free_left(uid)}
-
-
 # ----------------- Основной endpoint -----------------
 @app.post("/legalfox")
 async def legalfox(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
@@ -408,7 +445,6 @@ async def legalfox(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
 
     uid = pick_uid(payload)
     if not uid:
-        # Жёстко покажем ошибку вместо “молча 0 trial”
         logger.warning("UID is empty. Check BotHelp macros (user_id/bh_user_id/cuid).")
         return {"scenario": scenario, "reply_text": "Техническая ошибка: не удалось определить пользователя. Напиши в поддержку."}
 
@@ -421,8 +457,10 @@ async def legalfox(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
     can_file = premium or (trial_left > 0)
     with_file = with_file_requested and can_file
 
-    logger.info("Scenario=%s uid=%s premium=%s trial_left=%s with_file_requested=%s with_file=%s",
-                scenario, uid, premium, trial_left, with_file_requested, with_file)
+    logger.info(
+        "Scenario=%s uid=%s premium=%s trial_left=%s with_file_requested=%s with_file=%s",
+        scenario, uid, premium, trial_left, with_file_requested, with_file
+    )
 
     try:
         if scenario == "contract":
@@ -433,25 +471,22 @@ async def legalfox(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
             special = payload.get("Особые условия") or payload.get("Особые_условия") or ""
 
             user_text = (
-                f"Тип договора: {contract_type}\n"
-                f"Стороны: {parties}\n"
-                f"Предмет: {subject}\n"
-                f"Сроки и оплата: {terms_pay}\n"
-                f"Особые условия: {special}\n"
+                f"Тип договора: {contract_type or '___'}\n"
+                f"Стороны (как указано пользователем): {parties or '___'}\n"
+                f"Предмет договора: {subject or '___'}\n"
+                f"Сроки и оплата (как указано пользователем): {terms_pay or '___'}\n"
+                f"Особые условия (как указано пользователем): {special or '___'}\n"
             ).strip()
 
-            if not user_text.strip():
-                return {"scenario": "contract", "reply_text": "Не вижу данных. Заполни поля и повтори."}
-
             draft = await call_groq(PROMPT_CONTRACT, user_text)
-            result: Dict[str, str] = {"scenario": "contract", "reply_text": draft}
+
+            result: Dict[str, str] = {"scenario": "contract", "reply_text": ""}
 
             if with_file:
                 fn = safe_filename("contract")
                 out_path = os.path.join(FILES_DIR, fn)
                 render_pdf(draft, out_path, title="ДОГОВОР (ЧЕРНОВИК)")
 
-                # списываем trial, только если не premium и trial реально был
                 if (not premium) and trial_left > 0:
                     consume_free(uid)
 
@@ -459,7 +494,9 @@ async def legalfox(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
                 if url:
                     result["file_url"] = url
 
+                result["reply_text"] = "Готово. Я подготовил черновик договора — просто скачай PDF по кнопке ниже."
             else:
+                result["reply_text"] = draft
                 if with_file_requested and (not premium) and trial_left <= 0:
                     result["reply_text"] = (
                         draft
@@ -478,19 +515,17 @@ async def legalfox(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
             contacts = payload.get("Контакты") or ""
 
             user_text = (
-                f"Адресат: {to_whom}\n"
-                f"Основание: {basis}\n"
-                f"Нарушение и обстоятельства: {viol}\n"
-                f"Требования: {reqs}\n"
-                f"Срок исполнения: {term}\n"
-                f"Контакты: {contacts}\n"
+                f"Адресат: {to_whom or '___'}\n"
+                f"Основание: {basis or '___'}\n"
+                f"Нарушение и обстоятельства: {viol or '___'}\n"
+                f"Требования: {reqs or '___'}\n"
+                f"Срок исполнения: {term or '___'}\n"
+                f"Контакты: {contacts or '___'}\n"
             ).strip()
 
-            if not user_text.strip():
-                return {"scenario": "claim", "reply_text": "Не вижу данных. Заполни поля и повтори."}
-
             draft = await call_groq(PROMPT_CLAIM, user_text)
-            result: Dict[str, str] = {"scenario": "claim", "reply_text": draft}
+
+            result: Dict[str, str] = {"scenario": "claim", "reply_text": ""}
 
             if with_file:
                 fn = safe_filename("claim")
@@ -504,7 +539,9 @@ async def legalfox(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
                 if url:
                     result["file_url"] = url
 
+                result["reply_text"] = "Готово. Я подготовил черновик претензии — просто скачай PDF по кнопке ниже."
             else:
+                result["reply_text"] = draft
                 if with_file_requested and (not premium) and trial_left <= 0:
                     result["reply_text"] = (
                         draft
@@ -514,7 +551,7 @@ async def legalfox(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
 
             return result
 
-        # scenario == "clause"
+        # clause
         q = payload.get("Запрос") or payload.get("query") or payload.get("Вопрос") or payload.get("Текст") or ""
         q = str(q).strip()
         if not q:
