@@ -34,21 +34,18 @@ DB_PATH = os.getenv("DB_PATH", "legalfox.db")
 LLM_PROVIDER = (os.getenv("LLM_PROVIDER", "gigachat") or "gigachat").strip().lower()
 
 # GigaChat
-GIGACHAT_AUTH_KEY = os.getenv("GIGACHAT_AUTH_KEY")  # base64(ClientID:ClientSecret)
+GIGACHAT_AUTH_KEY = os.getenv("GIGACHAT_AUTH_KEY")
 GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
 GIGACHAT_MODEL = os.getenv("GIGACHAT_MODEL", "GigaChat")
 
 GIGACHAT_OAUTH_URL = os.getenv("GIGACHAT_OAUTH_URL", "https://ngw.devices.sberbank.ru:9443/api/v2/oauth")
 GIGACHAT_BASE_URL = os.getenv("GIGACHAT_BASE_URL", "https://gigachat.devices.sberbank.ru")
-# В Railway при CERTIFICATE_VERIFY_FAILED ставь 0
 GIGACHAT_VERIFY_SSL = (os.getenv("GIGACHAT_VERIFY_SSL", "1").strip() != "0")
 
 # 1 бесплатный PDF на пользователя
 FREE_PDF_LIMIT = int(os.getenv("FREE_PDF_LIMIT", "1"))
 
-# Опционально: показать короткую причину ошибки в reply_text (не включай на проде)
 DEBUG_ERRORS = (os.getenv("DEBUG_ERRORS", "0").strip() == "1")
-
 FALLBACK_TEXT = "Сейчас не могу обратиться к нейросети. Попробуй повторить чуть позже."
 
 
@@ -197,7 +194,7 @@ def make_error_response(scenario: str, err: Optional[Exception] = None) -> Dict[
     msg = FALLBACK_TEXT
     if DEBUG_ERRORS and err is not None:
         msg += f"\n\n[DEBUG] {type(err).__name__}: {str(err)[:180]}"
-    return {"scenario": scenario, "reply_text": msg, "file_url": ""}
+    return {"scenario": scenario, "reply_text": msg, "file_url": "", "has_file": "0"}
 
 
 # ----------------- БД -----------------
@@ -239,10 +236,7 @@ def free_left(uid: str) -> int:
 
 
 def try_consume_free(uid: str) -> bool:
-    """
-    АТОМАРНО списывает 1 пробный PDF.
-    Возвращает True только если реально списали (rowcount == 1).
-    """
+    """Атомарно списывает 1 триал. True только если реально списали."""
     if not uid:
         return False
     ensure_user(uid)
@@ -256,8 +250,24 @@ def try_consume_free(uid: str) -> bool:
     con.commit()
     con.close()
     if ok:
-        logger.info("Trial PDF списан uid=%s", uid)
+        logger.info("Trial reserved/consumed uid=%s", uid)
     return ok
+
+
+def refund_free(uid: str):
+    """Возврат триала, если мы его списали, но потом не смогли выдать PDF (ошибка LLM/рендера)."""
+    if not uid:
+        return
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    # Возвращаем ровно 1, но не превышаем FREE_PDF_LIMIT
+    cur.execute(
+        "UPDATE users SET free_pdf_left = CASE WHEN free_pdf_left < ? THEN free_pdf_left + 1 ELSE free_pdf_left END WHERE uid=?",
+        (FREE_PDF_LIMIT, uid),
+    )
+    con.commit()
+    con.close()
+    logger.info("Trial refunded uid=%s", uid)
 
 
 # ----------------- PDF -----------------
@@ -421,7 +431,7 @@ async def call_llm(system_prompt: str, user_input: str, max_tokens: int = 1400) 
 
 
 # ----------------- FastAPI -----------------
-app = FastAPI(title="LegalFox API", version="1.6.1-gigachat")
+app = FastAPI(title="LegalFox API", version="1.6.2-gigachat")
 
 os.makedirs(FILES_DIR, exist_ok=True)
 app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
@@ -469,6 +479,10 @@ def file_url_for(filename: str, request: Request) -> str:
     return f"{base}/files/{filename}"
 
 
+def _base_result(scenario: str) -> Dict[str, str]:
+    return {"scenario": scenario, "reply_text": "", "file_url": "", "has_file": "0"}
+
+
 @app.post("/legalfox")
 async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
     scenario_raw = payload.get("scenario") or payload.get("Сценарий") or payload.get("сценарий") or "contract"
@@ -476,22 +490,29 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
 
     uid, uid_src = pick_uid(payload)
     if not uid:
-        return {"scenario": scenario, "reply_text": "Техническая ошибка: не удалось определить пользователя.", "file_url": ""}
+        r = _base_result(scenario)
+        r["reply_text"] = "Техническая ошибка: не удалось определить пользователя."
+        return r
 
     ensure_user(uid)
 
     premium = get_premium_flag(payload)
     with_file_requested = get_with_file_requested(payload)
 
-    # Только для логов/инфо, НЕ для принятия решения о выдаче файла (это делаем атомарно)
-    trial_left_snapshot = free_left(uid)
-
+    trial_snapshot = free_left(uid)
     logger.info(
         "Scenario=%s uid=%s(uid_src=%s) premium=%s trial_left=%s with_file_requested=%s model=%s",
-        scenario, uid, uid_src, premium, trial_left_snapshot, with_file_requested, GIGACHAT_MODEL
+        scenario, uid, uid_src, premium, trial_snapshot, with_file_requested, GIGACHAT_MODEL
     )
 
+    # Резервируем триал ДО генерации PDF, чтобы двойной клик не дал два PDF
+    reserved_trial = False
+    if with_file_requested and (not premium):
+        reserved_trial = try_consume_free(uid)
+        logger.info("PDF reserve attempt uid=%s reserved=%s", uid, reserved_trial)
+
     try:
+        # ----------------- CONTRACT -----------------
         if scenario == "contract":
             contract_type = payload.get("Тип договора") or payload.get("Тип_договора") or ""
             parties = payload.get("Стороны") or ""
@@ -518,39 +539,35 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 logger.warning("Comment generation failed (contract): %s", e)
                 comment = ""
 
-            result: Dict[str, str] = {"scenario": "contract", "reply_text": "", "file_url": ""}
+            result = _base_result("contract")
 
+            can_send_pdf = False
             if with_file_requested:
-                if premium:
-                    allow_pdf = True
-                else:
-                    # атомарно списываем триал именно на момент выдачи PDF
-                    allow_pdf = try_consume_free(uid)
+                can_send_pdf = premium or reserved_trial
 
-                if allow_pdf:
-                    fn = safe_filename("contract")
-                    out_path = os.path.join(FILES_DIR, fn)
-                    render_pdf(draft, out_path, title="ДОГОВОР (ЧЕРНОВИК)")
+            if can_send_pdf:
+                fn = safe_filename("contract")
+                out_path = os.path.join(FILES_DIR, fn)
+                render_pdf(draft, out_path, title="ДОГОВОР (ЧЕРНОВИК)")
 
-                    result["file_url"] = file_url_for(fn, request)
-                    result["reply_text"] = (
-                        "Готово. Я подготовил черновик договора и приложил PDF-файл."
-                        + (f"\n\nКомментарий по вашему кейсу:\n{comment}" if comment else "")
-                    )
-                    return result
+                result["file_url"] = file_url_for(fn, request)
+                result["has_file"] = "1"
+                result["reply_text"] = (
+                    "Готово. Я подготовил черновик договора и приложил PDF-файл."
+                    + (f"\n\nКомментарий по вашему кейсу:\n{comment}" if comment else "")
+                )
+                return result
 
-                # не premium и триал уже 0
-                result["reply_text"] = draft + (f"\n\nКомментарий:\n{comment}" if comment else "")
+            # PDF просили, но не дали (триал закончился и не premium)
+            result["reply_text"] = draft + (f"\n\nКомментарий:\n{comment}" if comment else "")
+            if with_file_requested and (not premium) and (not reserved_trial):
                 result["reply_text"] += (
                     "\n\nPDF-документ доступен по подписке. "
                     "Пробный PDF уже использован — оформи подписку, чтобы получать PDF без ограничений."
                 )
-                return result
-
-            # если файл не просили — просто текст
-            result["reply_text"] = draft + (f"\n\nКомментарий:\n{comment}" if comment else "")
             return result
 
+        # ----------------- CLAIM -----------------
         if scenario == "claim":
             to_whom = payload.get("Адресат") or ""
             basis = payload.get("Основание") or ""
@@ -579,45 +596,48 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 logger.warning("Comment generation failed (claim): %s", e)
                 comment = ""
 
-            result: Dict[str, str] = {"scenario": "claim", "reply_text": "", "file_url": ""}
+            result = _base_result("claim")
 
+            can_send_pdf = False
             if with_file_requested:
-                if premium:
-                    allow_pdf = True
-                else:
-                    allow_pdf = try_consume_free(uid)
+                can_send_pdf = premium or reserved_trial
 
-                if allow_pdf:
-                    fn = safe_filename("claim")
-                    out_path = os.path.join(FILES_DIR, fn)
-                    render_pdf(draft, out_path, title="ПРЕТЕНЗИЯ (ЧЕРНОВИК)")
+            if can_send_pdf:
+                fn = safe_filename("claim")
+                out_path = os.path.join(FILES_DIR, fn)
+                render_pdf(draft, out_path, title="ПРЕТЕНЗИЯ (ЧЕРНОВИК)")
 
-                    result["file_url"] = file_url_for(fn, request)
-                    result["reply_text"] = (
-                        "Готово. Я подготовил черновик претензии и приложил PDF-файл."
-                        + (f"\n\nКомментарий по вашему кейсу:\n{comment}" if comment else "")
-                    )
-                    return result
-
-                result["reply_text"] = draft + (f"\n\nКомментарий:\n{comment}" if comment else "")
-                result["reply_text"] += (
-                    "\n\nPDF-документ доступен по подписке. "
-                    "Пробный PDF уже использован — оформи подписку, чтобы получать PDF без ограничений."
+                result["file_url"] = file_url_for(fn, request)
+                result["has_file"] = "1"
+                result["reply_text"] = (
+                    "Готово. Я подготовил черновик претензии и приложил PDF-файл."
+                    + (f"\n\nКомментарий по вашему кейсу:\n{comment}" if comment else "")
                 )
                 return result
 
             result["reply_text"] = draft + (f"\n\nКомментарий:\n{comment}" if comment else "")
+            if with_file_requested and (not premium) and (not reserved_trial):
+                result["reply_text"] += (
+                    "\n\nPDF-документ доступен по подписке. "
+                    "Пробный PDF уже использован — оформи подписку, чтобы получать PDF без ограничений."
+                )
             return result
 
-        # clause
+        # ----------------- CLAUSE -----------------
         q = payload.get("Запрос") or payload.get("query") or payload.get("Вопрос") or payload.get("Текст") or ""
         q = str(q).strip()
+        result = _base_result("clause")
         if not q:
-            return {"scenario": "clause", "reply_text": "Напиши вопрос или вставь текст одним сообщением — помогу.", "file_url": ""}
+            result["reply_text"] = "Напиши вопрос или вставь текст одним сообщением — помогу."
+            return result
 
         answer = await call_llm(PROMPT_CLAUSE, q, max_tokens=800)
-        return {"scenario": "clause", "reply_text": answer, "file_url": ""}
+        result["reply_text"] = answer
+        return result
 
     except Exception as e:
         logger.exception("legalfox error: %s", e)
+        # если мы зарезервировали триал, но упали — вернем его
+        if reserved_trial and (not premium):
+            refund_free(uid)
         return make_error_response(scenario, e)
