@@ -42,10 +42,9 @@ GIGACHAT_OAUTH_URL = os.getenv("GIGACHAT_OAUTH_URL", "https://ngw.devices.sberba
 GIGACHAT_BASE_URL = os.getenv("GIGACHAT_BASE_URL", "https://gigachat.devices.sberbank.ru")
 GIGACHAT_VERIFY_SSL = (os.getenv("GIGACHAT_VERIFY_SSL", "1").strip() != "0")
 
-# 1 бесплатный PDF на пользователя
 FREE_PDF_LIMIT = int(os.getenv("FREE_PDF_LIMIT", "1"))
-
 DEBUG_ERRORS = (os.getenv("DEBUG_ERRORS", "0").strip() == "1")
+
 FALLBACK_TEXT = "Сейчас не могу обратиться к нейросети. Попробуй повторить чуть позже."
 
 
@@ -132,6 +131,23 @@ PROMPT_CLAUSE = """
 
 
 # ----------------- Утилиты -----------------
+_PLACEHOLDER_RE = re.compile(r"^\s*\{\%.*\%\}\s*$")
+
+def _is_bad_value(v: Any) -> bool:
+    """Отбрасываем пустое/None/null и плейсхолдеры BotHelp вида {%...%}."""
+    if v is None:
+        return True
+    s = str(v).strip()
+    if not s:
+        return True
+    low = s.lower()
+    if low in ("none", "null", "undefined"):
+        return True
+    if "{%" in s and "%}" in s and _PLACEHOLDER_RE.match(s):
+        return True
+    return False
+
+
 def normalize_bool(v: Any) -> bool:
     if v is None:
         return False
@@ -158,6 +174,10 @@ def safe_filename(prefix: str) -> str:
 
 
 def pick_uid(payload: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    ВАЖНО: BotHelp иногда отправляет не значение, а строку-шаблон "{%bh_user_id%}".
+    Такое нужно игнорировать, иначе все пользователи становятся одним uid и trial “умирает”.
+    """
     priority = [
         "bh_user_id",
         "user_id",
@@ -167,13 +187,20 @@ def pick_uid(payload: Dict[str, Any]) -> Tuple[str, str]:
         "bothelp_user_id",
         "cuid",
     ]
+
+    # Лог кандидатов (с обрезкой), чтобы быстро диагностировать
+    cand = {k: (str(payload.get(k))[:60] if payload.get(k) is not None else None) for k in priority if k in payload}
+    if cand:
+        logger.info("UID candidates: %s", cand)
+
     for key in priority:
-        v = payload.get(key)
-        if v is None:
+        if key not in payload:
             continue
-        v = str(v).strip()
-        if v:
-            return v, key
+        v = payload.get(key)
+        if _is_bad_value(v):
+            continue
+        return str(v).strip(), key
+
     return "", ""
 
 
@@ -194,7 +221,6 @@ def make_error_response(scenario: str, err: Optional[Exception] = None) -> Dict[
     msg = FALLBACK_TEXT
     if DEBUG_ERRORS and err is not None:
         msg += f"\n\n[DEBUG] {type(err).__name__}: {str(err)[:180]}"
-    # критично: file_url всегда пустой при ошибке
     return {"scenario": scenario, "reply_text": msg, "file_url": ""}
 
 
@@ -237,10 +263,7 @@ def free_left(uid: str) -> int:
 
 
 def try_reserve_trial(uid: str) -> bool:
-    """
-    Атомарно резервирует/списывает 1 триал.
-    Возвращает True только если реально списали (rowcount == 1).
-    """
+    """Атомарно списывает 1 триал. True только если реально списали."""
     if not uid:
         return False
     ensure_user(uid)
@@ -253,13 +276,12 @@ def try_reserve_trial(uid: str) -> bool:
     ok = (cur.rowcount == 1)
     con.commit()
     con.close()
-    if ok:
-        logger.info("Trial reserved uid=%s", uid)
+    logger.info("Trial reserve uid=%s ok=%s", uid, ok)
     return ok
 
 
 def refund_trial(uid: str):
-    """Возвращаем 1 триал (если резервировали, но потом не выдали PDF)."""
+    """Возвращаем 1 триал, если списали, но PDF не выдали из-за ошибки."""
     if not uid:
         return
     con = sqlite3.connect(DB_PATH)
@@ -434,7 +456,7 @@ async def call_llm(system_prompt: str, user_input: str, max_tokens: int = 1400) 
 
 
 # ----------------- FastAPI -----------------
-app = FastAPI(title="LegalFox API", version="1.6.3-gigachat")
+app = FastAPI(title="LegalFox API", version="1.6.4-gigachat-uidfix")
 
 os.makedirs(FILES_DIR, exist_ok=True)
 app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
@@ -450,6 +472,7 @@ async def root():
         "llm": LLM_PROVIDER,
         "model": GIGACHAT_MODEL,
         "verify_ssl": bool(GIGACHAT_VERIFY_SSL),
+        "free_pdf_limit": FREE_PDF_LIMIT,
     }
 
 
@@ -503,7 +526,6 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
     )
 
     try:
-        # ----------------- CONTRACT -----------------
         if scenario == "contract":
             contract_type = payload.get("Тип договора") or payload.get("Тип_договора") or ""
             parties = payload.get("Стороны") or ""
@@ -532,7 +554,6 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
 
             result: Dict[str, str] = {"scenario": "contract", "reply_text": "", "file_url": ""}
 
-            # ВАЖНО: резервируем триал только тут, когда реально хотим PDF
             reserved_trial = False
             if with_file_requested and (not premium):
                 reserved_trial = try_reserve_trial(uid)
@@ -552,12 +573,10 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                     )
                     return result
                 except Exception as e:
-                    # если PDF не смогли создать — вернем триал
                     if reserved_trial and (not premium):
                         refund_trial(uid)
                     raise e
 
-            # PDF не выдаем
             result["reply_text"] = draft + (f"\n\nКомментарий:\n{comment}" if comment else "")
             if with_file_requested and (not premium) and (not reserved_trial):
                 result["reply_text"] += (
@@ -566,7 +585,6 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 )
             return result
 
-        # ----------------- CLAIM -----------------
         if scenario == "claim":
             to_whom = payload.get("Адресат") or ""
             basis = payload.get("Основание") or ""
@@ -628,7 +646,7 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 )
             return result
 
-        # ----------------- CLAUSE -----------------
+        # clause
         q = payload.get("Запрос") or payload.get("query") or payload.get("Вопрос") or payload.get("Текст") or ""
         q = str(q).strip()
         if not q:
