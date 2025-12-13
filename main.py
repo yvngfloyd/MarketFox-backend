@@ -64,18 +64,13 @@ PROMPT_CONTRACT = """
 4) Максимально конкретно используй входные данные: тип договора, стороны, предмет, сроки, оплата, особые условия.
 5) Пиши как реальный документ РФ:
    - Название сверху: "ДОГОВОР <тип договора>" (если тип договора не указан — "ДОГОВОР")
-   - Город: ___   Дата: ___  (если не указаны во вводе)
+   - Город: ___   Дата: ___
    - Разделы с нумерацией: 1. Предмет договора, 2. Права и обязанности, 3. Цена и порядок расчётов,
      4. Сроки, 5. Ответственность сторон, 6. Форс-мажор, 7. Порядок разрешения споров,
      8. Срок действия и расторжение, 9. Заключительные положения, 10. Реквизиты и подписи.
-6) Форс-мажор: корректная формулировка ("чрезвычайные и непредотвратимые обстоятельства") без странных примеров,
-   если пользователь сам их не указал.
-7) Суммы/сроки:
-   - если сумма/срок не указаны — оставь понятное место: "___ рублей", "___ календарных дней"
-   - не пиши случайные числа.
-8) Если "особые условия" содержат важные пункты — встрои их в соответствующие разделы.
-9) В конце: "Реквизиты и подписи сторон" с полями. Ничего не выдумывай — если нет данных, "___".
-10) Аккуратная верстка: короткие абзацы, пустые строки между разделами.
+6) Суммы/сроки: если не указаны — "___ рублей", "___ календарных дней".
+7) В конце: "Реквизиты и подписи сторон" с полями. Ничего не выдумывай — если нет данных, "___".
+8) Аккуратная верстка: короткие абзацы, пустые строки между разделами.
 """
 
 PROMPT_CLAIM = """
@@ -84,53 +79,48 @@ PROMPT_CLAIM = """
 
 Жёсткие правила (обязательно):
 1) Без Markdown.
-2) Не используй заглушки вида "СТОРОНА_1", "АДРЕС_1", "СУММА_1" и т.п.
-   Если данных нет — "___". Если есть — вставляй как есть, без кавычек.
-3) Ничего не выдумывай: даты, суммы, реквизиты, нормы закона — только если пользователь дал их явно.
-   Если не дал — оставь "___" или нейтральную формулировку без ссылок на конкретные статьи.
+2) Если данных нет — "___". Если есть — вставляй как есть.
+3) Ничего не выдумывай: даты, суммы, реквизиты, нормы закона — только если пользователь дал явно.
 4) Структура:
-   - Кому: ___
-   - От кого: ___
-   - Заголовок: "ПРЕТЕНЗИЯ"
-   - Описание обстоятельств (кратко, по делу)
-   - Требования (конкретно)
-   - Срок исполнения требований: ___ дней (если не указан)
+   - Кому / От кого
+   - "ПРЕТЕНЗИЯ"
+   - Обстоятельства
+   - Требования
+   - Срок исполнения: ___ дней
    - Приложения (если уместно)
    - Дата/подпись/контакты
-5) Текст должен выглядеть как документ: абзацы, пустые строки между блоками.
+5) Абзацы + пустые строки.
 """
 
 PROMPT_CONTRACT_COMMENT = """
 Ты — LegalFox. Пользователь ввёл данные для договора.
-Сделай КОРОТКИЙ КОММЕНТАРИЙ к будущему договору на основе введённых данных.
+Сделай КОРОТКИЙ КОММЕНТАРИЙ на основе введённых данных.
 
 Строго:
 - Без Markdown.
 - 6–10 коротких строк.
-- По делу: что проверить, что уточнить/добавить, где риски.
+- Что проверить/уточнить/добавить, где риски.
 - Если чего-то не хватает — перечисли конкретно.
-- Не обещай результат и не выдавай себя за адвоката.
+- Не обещай результат.
 """
 
 PROMPT_CLAIM_COMMENT = """
 Ты — LegalFox. Пользователь ввёл данные для претензии.
-Сделай КОРОТКИЙ КОММЕНТАРИЙ к претензии на основе введённых данных.
+Сделай КОРОТКИЙ КОММЕНТАРИЙ на основе введённых данных.
 
 Строго:
 - Без Markdown.
 - 6–10 коротких строк.
-- По делу: что проверить, какие доказательства/данные добавить, какой срок указать, что приложить.
+- Какие данные/доказательства добавить, что приложить, что уточнить.
 - Если чего-то не хватает — перечисли конкретно.
-- Не обещай результат и не выдавай себя за адвоката.
+- Не обещай результат.
 """
 
 PROMPT_CLAUSE = """
 Ты — LegalFox. Пользователь прислал вопрос или кусок текста.
-Нужно:
-- Ответить по-русски, по делу, без Markdown.
-- Если нужно — переформулировать текст юридически аккуратнее, сохранив смысл.
-- Короткие абзацы, пустые строки между блоками.
-- Не выдавай себя за адвоката и не обещай гарантированный исход.
+Ответь по-русски, по делу, без Markdown.
+Если нужно — переформулируй юридически аккуратнее, сохранив смысл.
+Короткие абзацы, пустые строки.
 """
 
 
@@ -161,7 +151,6 @@ def safe_filename(prefix: str) -> str:
 
 
 def pick_uid(payload: Dict[str, Any]) -> Tuple[str, str]:
-    # cuid — последним, чтобы UID не “скакал”
     priority = [
         "bh_user_id",
         "user_id",
@@ -169,7 +158,7 @@ def pick_uid(payload: Dict[str, Any]) -> Tuple[str, str]:
         "telegram_user_id",
         "messenger_user_id",
         "bothelp_user_id",
-        "cuid",
+        "cuid",  # последним
     ]
     for key in priority:
         v = payload.get(key)
@@ -179,6 +168,11 @@ def pick_uid(payload: Dict[str, Any]) -> Tuple[str, str]:
         if v:
             return v, key
     return "", ""
+
+
+def make_error_response(scenario: str) -> Dict[str, str]:
+    # КРИТИЧНО: всегда возвращаем file_url="", чтобы BotHelp не “подхватил” старое значение
+    return {"scenario": scenario, "reply_text": FALLBACK_TEXT, "file_url": ""}
 
 
 # ----------------- БД -----------------
@@ -300,28 +294,23 @@ def render_pdf(text: str, out_path: str, title: str):
 # ----------------- GigaChat Token Cache -----------------
 _token_lock = asyncio.Lock()
 _token_value: Optional[str] = None
-_token_exp: float = 0.0  # epoch seconds
+_token_exp: float = 0.0
+
 
 def _now() -> float:
     return time.time()
 
 
 async def get_gigachat_access_token() -> str:
-    """
-    Получаем access_token (живет 30 минут).
-    Кэшируем и обновляем заранее (примерно за 5 минут до истечения).
-    """
     global _token_value, _token_exp
 
     if not GIGACHAT_AUTH_KEY:
         raise RuntimeError("GIGACHAT_AUTH_KEY not set")
 
-    # быстрый путь без lock
     if _token_value and _now() < (_token_exp - 60):
         return _token_value
 
     async with _token_lock:
-        # повторная проверка после lock
         if _token_value and _now() < (_token_exp - 60):
             return _token_value
 
@@ -343,10 +332,9 @@ async def get_gigachat_access_token() -> str:
         if not token:
             raise RuntimeError(f"OAuth ответ без access_token: {js}")
 
-        # По докам токен 30 минут. Ставим 25 минут, чтобы не ловить истечение.
         _token_value = token
-        _token_exp = _now() + 25 * 60
-        logger.info("GigaChat token refreshed rq_uid=%s exp_in≈%ss", rq_uid, 25 * 60)
+        _token_exp = _now() + 25 * 60  # заранее обновляем
+        logger.info("GigaChat token refreshed rq_uid=%s", rq_uid)
         return _token_value
 
 
@@ -372,13 +360,11 @@ async def call_gigachat(system_prompt: str, user_content: str, max_tokens: int =
         "stream": False,
     }
 
-    async with httpx.AsyncClient(timeout=90, verify=True) as client:
+    async with httpx.AsyncClient(timeout=90, verify=GIGACHAT_VERIFY_SSL) as client:
         r = await client.post(url, headers=headers, json=payload)
 
-        # Если токен вдруг протух — обновим и повторим 1 раз
         if r.status_code in (401, 403):
             logger.warning("GigaChat auth error %s, refreshing token and retrying once", r.status_code)
-            # сброс кэша
             global _token_value, _token_exp
             _token_value, _token_exp = None, 0.0
             token = await get_gigachat_access_token()
@@ -403,7 +389,7 @@ async def call_llm(system_prompt: str, user_input: str, max_tokens: int = 1400) 
 
 
 # ----------------- FastAPI -----------------
-app = FastAPI(title="LegalFox API", version="1.5.0-gigachat")
+app = FastAPI(title="LegalFox API", version="1.5.2-gigachat")
 
 os.makedirs(FILES_DIR, exist_ok=True)
 app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
@@ -452,7 +438,7 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
 
     uid, uid_src = pick_uid(payload)
     if not uid:
-        return {"scenario": scenario, "reply_text": "Техническая ошибка: не удалось определить пользователя. Напиши в поддержку."}
+        return {"scenario": scenario, "reply_text": "Техническая ошибка: не удалось определить пользователя.", "file_url": ""}
 
     ensure_user(uid)
 
@@ -484,10 +470,16 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 f"Особые условия (как указано пользователем): {special or '___'}\n"
             ).strip()
 
+            # Если LLM упал — НЕ даём файл
             draft = await call_llm(PROMPT_CONTRACT, user_text, max_tokens=1400)
-            comment = await call_llm(PROMPT_CONTRACT_COMMENT, user_text, max_tokens=420)
+            comment = ""
+            try:
+                comment = await call_llm(PROMPT_CONTRACT_COMMENT, user_text, max_tokens=420)
+            except Exception as e:
+                logger.warning("Comment generation failed (contract): %s", e)
+                comment = ""
 
-            result: Dict[str, str] = {"scenario": "contract", "reply_text": ""}
+            result: Dict[str, str] = {"scenario": "contract", "reply_text": "", "file_url": ""}
 
             if with_file:
                 fn = safe_filename("contract")
@@ -499,21 +491,18 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
 
                 result["file_url"] = file_url_for(fn, request)
                 result["reply_text"] = (
-                    "Готово. Я подготовил черновик договора и приложил PDF-файл.\n\n"
-                    "Комментарий по вашему кейсу:\n"
-                    f"{comment}"
+                    "Готово. Я подготовил черновик договора и приложил PDF-файл."
+                    + (f"\n\nКомментарий по вашему кейсу:\n{comment}" if comment else "")
                 )
             else:
-                result["reply_text"] = (
-                    draft
-                    + "\n\nКомментарий:\n"
-                    + comment
-                )
+                result["reply_text"] = draft + (f"\n\nКомментарий:\n{comment}" if comment else "")
+                # важно: file_url уже "" (перезатираем BotHelp)
                 if with_file_requested and (not premium) and trial_left <= 0:
                     result["reply_text"] += (
                         "\n\nPDF-документ доступен по подписке. "
                         "Пробный PDF уже использован — оформи подписку, чтобы получать PDF без ограничений."
                     )
+
             return result
 
         if scenario == "claim":
@@ -534,9 +523,14 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
             ).strip()
 
             draft = await call_llm(PROMPT_CLAIM, user_text, max_tokens=1400)
-            comment = await call_llm(PROMPT_CLAIM_COMMENT, user_text, max_tokens=420)
+            comment = ""
+            try:
+                comment = await call_llm(PROMPT_CLAIM_COMMENT, user_text, max_tokens=420)
+            except Exception as e:
+                logger.warning("Comment generation failed (claim): %s", e)
+                comment = ""
 
-            result: Dict[str, str] = {"scenario": "claim", "reply_text": ""}
+            result: Dict[str, str] = {"scenario": "claim", "reply_text": "", "file_url": ""}
 
             if with_file:
                 fn = safe_filename("claim")
@@ -548,16 +542,11 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
 
                 result["file_url"] = file_url_for(fn, request)
                 result["reply_text"] = (
-                    "Готово. Я подготовил черновик претензии и приложил PDF-файл.\n\n"
-                    "Комментарий по вашему кейсу:\n"
-                    f"{comment}"
+                    "Готово. Я подготовил черновик претензии и приложил PDF-файл."
+                    + (f"\n\nКомментарий по вашему кейсу:\n{comment}" if comment else "")
                 )
             else:
-                result["reply_text"] = (
-                    draft
-                    + "\n\nКомментарий:\n"
-                    + comment
-                )
+                result["reply_text"] = draft + (f"\n\nКомментарий:\n{comment}" if comment else "")
                 if with_file_requested and (not premium) and trial_left <= 0:
                     result["reply_text"] += (
                         "\n\nPDF-документ доступен по подписке. "
@@ -569,11 +558,11 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
         q = payload.get("Запрос") or payload.get("query") or payload.get("Вопрос") or payload.get("Текст") or ""
         q = str(q).strip()
         if not q:
-            return {"scenario": "clause", "reply_text": "Напиши вопрос или вставь текст одним сообщением — помогу исправить/улучшить."}
+            return {"scenario": "clause", "reply_text": "Напиши вопрос или вставь текст одним сообщением.", "file_url": ""}
 
         answer = await call_llm(PROMPT_CLAUSE, q, max_tokens=800)
-        return {"scenario": "clause", "reply_text": answer}
+        return {"scenario": "clause", "reply_text": answer, "file_url": ""}
 
     except Exception as e:
         logger.exception("legalfox error: %s", e)
-        return {"scenario": scenario, "reply_text": FALLBACK_TEXT}
+        return make_error_response(scenario)
