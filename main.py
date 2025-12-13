@@ -4,10 +4,10 @@ import uuid
 import time
 import sqlite3
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import httpx
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body, Header, HTTPException
 from fastapi.staticfiles import StaticFiles
 
 from reportlab.lib.pagesizes import A4
@@ -21,7 +21,8 @@ logger = logging.getLogger("legalfox")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
 handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s"))
-logger.addHandler(handler)
+if not logger.handlers:
+    logger.addHandler(handler)
 
 
 # ----------------- Конфиг -----------------
@@ -32,8 +33,15 @@ DB_PATH = os.getenv("DB_PATH", "legalfox.db")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
-# 1 бесплатный PDF на пользователя
-FREE_PDF_LIMIT = int(os.getenv("FREE_PDF_LIMIT", "1"))  # оставь 1
+# ВАЖНО: не даём FREE_PDF_LIMIT стать 0 из env
+_FREE_ENV = os.getenv("FREE_PDF_LIMIT", "1")
+try:
+    FREE_PDF_LIMIT = max(1, int(_FREE_ENV))
+except Exception:
+    FREE_PDF_LIMIT = 1
+
+# Админ-токен для сброса тестового пользователя
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
 FALLBACK_TEXT = "Сейчас не могу обратиться к нейросети. Попробуй повторить чуть позже."
 
@@ -84,15 +92,10 @@ def normalize_bool(v: Any) -> bool:
 def strip_markdown_noise(text: str) -> str:
     if not text:
         return ""
-    # удалить блоки ```...```
     text = re.sub(r"```.*?```", "", text, flags=re.S)
-    # убрать одиночные бэктики
     text = text.replace("`", "")
-    # убрать жирность/подчёркивания
     text = text.replace("**", "").replace("__", "")
-    # убрать маркдауны заголовков
     text = re.sub(r"^\s*#+\s*", "", text, flags=re.M)
-    # подчистить хвостовые пробелы
     text = re.sub(r"[ \t]+\n", "\n", text)
     return text.strip()
 
@@ -104,15 +107,23 @@ def safe_filename(prefix: str) -> str:
 
 def pick_uid(payload: Dict[str, Any]) -> str:
     """
-    Нужен стабильный ID пользователя (лучше всего telegram user_id).
-    BotHelp часто передаёт user_id как строку цифр.
+    Делаем UID максимально стабильным:
+    1) Telegram user_id
+    2) BotHelp subscriber id (bh_user_id)
+    3) cuid
+    4) другие варианты
     """
-    for key in ["user_id", "tg_user_id", "telegram_user_id", "messenger_user_id", "bothelp_user_id", "cuid"]:
+    keys = [
+        "user_id", "tg_user_id", "telegram_user_id", "messenger_user_id",
+        "bh_user_id", "bothelp_user_id", "cuid"
+    ]
+    for key in keys:
         v = payload.get(key)
         if v is None:
             continue
         v = str(v).strip()
         if v:
+            # нормализуем, чтобы в БД не было "tg:..." разных форматов
             return v
     return ""
 
@@ -175,12 +186,32 @@ def consume_free(uid: str):
     logger.info("Trial PDF списан uid=%s", uid)
 
 
+def reset_free(uid: str, value: int = 1):
+    if not uid:
+        return
+    value = max(0, int(value))
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("INSERT OR IGNORE INTO users(uid, free_pdf_left) VALUES(?, ?)", (uid, FREE_PDF_LIMIT))
+    cur.execute("UPDATE users SET free_pdf_left=? WHERE uid=?", (value, uid))
+    con.commit()
+    con.close()
+    logger.info("Trial PDF reset uid=%s -> %s", uid, value)
+
+
+def delete_user(uid: str):
+    if not uid:
+        return
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("DELETE FROM users WHERE uid=?", (uid,))
+    con.commit()
+    con.close()
+    logger.info("User deleted uid=%s", uid)
+
+
 # ----------------- PDF (кириллица) -----------------
 def ensure_font_name() -> str:
-    """
-    Чтобы кириллица выглядела нормально — добавь файл:
-      fonts/DejaVuSans.ttf
-    """
     try:
         font_path = os.path.join("fonts", "DejaVuSans.ttf")
         if os.path.exists(font_path):
@@ -203,7 +234,6 @@ def render_pdf(text: str, out_path: str, title: str):
     c.drawString(left, height - top, title)
 
     c.setFont(font_name, 11)
-
     y = height - top - 30
     line_height = 14
 
@@ -270,12 +300,14 @@ async def call_groq(system_prompt: str, user_content: str) -> str:
 
 
 # ----------------- FastAPI -----------------
-app = FastAPI(title="LegalFox API", version="1.1.0")
+app = FastAPI(title="LegalFox API", version="1.2.0")
 
 os.makedirs(FILES_DIR, exist_ok=True)
 app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
 
 db_init()
+
+logger.info("BOOT: DB_PATH=%s FREE_PDF_LIMIT=%s PUBLIC_BASE_URL=%s", DB_PATH, FREE_PDF_LIMIT, PUBLIC_BASE_URL)
 
 if not PUBLIC_BASE_URL:
     logger.warning("PUBLIC_BASE_URL не задан — file_url может быть некорректным. Задай PUBLIC_BASE_URL в Railway.")
@@ -288,22 +320,16 @@ async def root():
 
 def scenario_alias(s: str) -> str:
     s = (s or "").strip().lower()
-    # поддержка старых вариантов
     if s in ("draft_contract", "contract", "договора", "договора_черновик"):
         return "contract"
     if s in ("draft_claim", "claim", "претензия", "претензии"):
         return "claim"
     if s in ("clause", "ask", "help", "пункты", "правки"):
         return "clause"
-    # дефолт
     return "contract"
 
 
 def get_premium_flag(payload: Dict[str, Any]) -> bool:
-    """
-    Premium приходит из BotHelp как поле 1/0.
-    Поддержим разные варианты ключа.
-    """
     for key in ["Premium", "premium", "PREMIUM", "is_premium", "Подписка"]:
         if key in payload:
             return normalize_bool(payload.get(key))
@@ -311,15 +337,8 @@ def get_premium_flag(payload: Dict[str, Any]) -> bool:
 
 
 def get_with_file_requested(payload: Dict[str, Any]) -> bool:
-    """
-    Ты сейчас часто шлёшь with_file = {%Premium%}.
-    Поддержим:
-      - with_file
-      - Premium (как fallback)
-    """
     if "with_file" in payload:
         return normalize_bool(payload.get("with_file"))
-    # если with_file не прислали, будем считать что файл "просят", если Premium=1
     return get_premium_flag(payload)
 
 
@@ -329,6 +348,57 @@ def file_url_for(filename: str) -> str:
     return f"{PUBLIC_BASE_URL}/files/{filename}"
 
 
+# --------- Админ: сброс trial / посмотреть состояние ---------
+@app.post("/admin/reset_trial")
+async def admin_reset_trial(
+    payload: Dict[str, Any] = Body(...),
+    x_admin_token: Optional[str] = Header(default=None),
+):
+    if not ADMIN_TOKEN or x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    uid = str(payload.get("uid", "")).strip()
+    value = payload.get("value", FREE_PDF_LIMIT)
+
+    if not uid:
+        raise HTTPException(status_code=400, detail="uid required")
+
+    reset_free(uid, int(value))
+    return {"ok": True, "uid": uid, "free_pdf_left": free_left(uid)}
+
+
+@app.post("/admin/delete_user")
+async def admin_delete_user(
+    payload: Dict[str, Any] = Body(...),
+    x_admin_token: Optional[str] = Header(default=None),
+):
+    if not ADMIN_TOKEN or x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    uid = str(payload.get("uid", "")).strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="uid required")
+
+    delete_user(uid)
+    return {"ok": True, "uid": uid}
+
+
+@app.post("/admin/state")
+async def admin_state(
+    payload: Dict[str, Any] = Body(...),
+    x_admin_token: Optional[str] = Header(default=None),
+):
+    if not ADMIN_TOKEN or x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    uid = str(payload.get("uid", "")).strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="uid required")
+
+    return {"ok": True, "uid": uid, "free_pdf_left": free_left(uid)}
+
+
+# ----------------- Основной endpoint -----------------
 @app.post("/legalfox")
 async def legalfox(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
     logger.info("Incoming payload keys: %s", list(payload.keys()))
@@ -337,22 +407,25 @@ async def legalfox(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
     scenario = scenario_alias(str(scenario_raw))
 
     uid = pick_uid(payload)
+    if not uid:
+        # Жёстко покажем ошибку вместо “молча 0 trial”
+        logger.warning("UID is empty. Check BotHelp macros (user_id/bh_user_id/cuid).")
+        return {"scenario": scenario, "reply_text": "Техническая ошибка: не удалось определить пользователя. Напиши в поддержку."}
+
     ensure_user(uid)
 
     premium = get_premium_flag(payload)
     with_file_requested = get_with_file_requested(payload)
 
-    # 1 бесплатный PDF: разрешаем файл, если premium или есть trial
     trial_left = free_left(uid)
     can_file = premium or (trial_left > 0)
     with_file = with_file_requested and can_file
 
-    logger.info("Scenario=%s uid=%s premium=%s trial_left=%s with_file=%s",
-                scenario, uid, premium, trial_left, with_file)
+    logger.info("Scenario=%s uid=%s premium=%s trial_left=%s with_file_requested=%s with_file=%s",
+                scenario, uid, premium, trial_left, with_file_requested, with_file)
 
     try:
         if scenario == "contract":
-            # поля с пробелами/подчёркиваниями
             contract_type = payload.get("Тип договора") or payload.get("Тип_договора") or ""
             parties = payload.get("Стороны") or ""
             subject = payload.get("Предмет") or ""
@@ -371,16 +444,14 @@ async def legalfox(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
                 return {"scenario": "contract", "reply_text": "Не вижу данных. Заполни поля и повтори."}
 
             draft = await call_groq(PROMPT_CONTRACT, user_text)
-
             result: Dict[str, str] = {"scenario": "contract", "reply_text": draft}
 
             if with_file:
                 fn = safe_filename("contract")
                 out_path = os.path.join(FILES_DIR, fn)
                 render_pdf(draft, out_path, title="ДОГОВОР (ЧЕРНОВИК)")
-                logger.info("PDF создан: %s", out_path)
 
-                # если это был trial — списываем
+                # списываем trial, только если не premium и trial реально был
                 if (not premium) and trial_left > 0:
                     consume_free(uid)
 
@@ -389,7 +460,6 @@ async def legalfox(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
                     result["file_url"] = url
 
             else:
-                # если человек хотел файл, но лимит уже исчерпан
                 if with_file_requested and (not premium) and trial_left <= 0:
                     result["reply_text"] = (
                         draft
@@ -420,14 +490,12 @@ async def legalfox(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
                 return {"scenario": "claim", "reply_text": "Не вижу данных. Заполни поля и повтори."}
 
             draft = await call_groq(PROMPT_CLAIM, user_text)
-
-            result = {"scenario": "claim", "reply_text": draft}
+            result: Dict[str, str] = {"scenario": "claim", "reply_text": draft}
 
             if with_file:
                 fn = safe_filename("claim")
                 out_path = os.path.join(FILES_DIR, fn)
                 render_pdf(draft, out_path, title="ПРЕТЕНЗИЯ (ЧЕРНОВИК)")
-                logger.info("PDF создан: %s", out_path)
 
                 if (not premium) and trial_left > 0:
                     consume_free(uid)
