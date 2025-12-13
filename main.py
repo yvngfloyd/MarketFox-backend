@@ -54,7 +54,8 @@ def _safe_int(name: str, default: int) -> int:
         return default
 
 FREE_PDF_LIMIT = max(0, _safe_int("FREE_PDF_LIMIT", 1))
-TRIAL_DEBUG = (os.getenv("TRIAL_DEBUG", "0").strip() == "1")
+
+# Debug (по желанию)
 DEBUG_ERRORS = (os.getenv("DEBUG_ERRORS", "0").strip() == "1")
 
 # PDF layout
@@ -67,7 +68,9 @@ PDF_RIGHT_MM = float(os.getenv("PDF_RIGHT_MM", "15"))
 PDF_TOP_MM = float(os.getenv("PDF_TOP_MM", "20"))
 PDF_BOTTOM_MM = float(os.getenv("PDF_BOTTOM_MM", "20"))
 
-INCLUDE_FILE_LINK = (os.getenv("INCLUDE_FILE_LINK", "0").strip() == "1")
+# ВАЖНО: чтобы PDF всегда доходил, кладём ссылку в текст (без дубля)
+# (даже если BotHelp по какой-то причине не прикрепляет файл)
+ALWAYS_INCLUDE_LINK_IN_TEXT = (os.getenv("ALWAYS_INCLUDE_LINK_IN_TEXT", "1").strip() == "1")
 
 FALLBACK_TEXT = "Сейчас не могу обратиться к нейросети. Попробуй повторить чуть позже."
 URL_ERROR_TEXT = "Техническая ошибка: не удалось сформировать публичную ссылку на PDF. Проверь PUBLIC_BASE_URL."
@@ -84,7 +87,8 @@ PROMPT_CONTRACT = """
 2) Не используй заглушки вида "СТОРОНА_1", "АДРЕС_1", "ПРЕДМЕТ". Если данных нет — ставь "___".
 3) Ничего не выдумывай: реквизиты, суммы, сроки — только если пользователь дал явно.
 4) Используй введённые поля максимально конкретно.
-5) Разделы с нумерацией 1., 2., 3. Разделы отделяй пустой строкой. Без маркеров •/—.
+5) Разделы с нумерацией 1., 2., 3. Разделы отделяй пустой строкой.
+6) Без маркеров •/—, только обычный текст и нумерация.
 """
 
 PROMPT_CLAIM = """
@@ -96,17 +100,28 @@ PROMPT_CLAIM = """
 2) Если данных нет — "___".
 3) Ничего не выдумывай: даты, суммы, нормы закона — только если пользователь дал явно.
 4) Блоки: Кому/От кого/ПРЕТЕНЗИЯ/Обстоятельства/Требования/Срок/Приложения/Дата/Подпись/Контакты.
-5) Блоки отделяй пустой строкой. Без маркеров •/—.
+5) Блоки отделяй пустой строкой.
+6) Без маркеров •/—, только обычный текст.
 """
 
+# Комментарии: без вопросов и без "?"
 PROMPT_CONTRACT_COMMENT = """
 Ты — LegalFox. Дай краткий комментарий по кейсу договора (6–10 строк).
-Без Markdown. Не задавай вопросов. Пиши как чек-лист "проверь/добавь/уточни".
+Строго:
+- Без Markdown.
+- Не задавай вопросы.
+- Не используй символ '?'.
+- Пиши утверждениями/инструкциями: "Проверь...", "Укажи...", "Добавь...", "Закрепи...".
 """
 
 PROMPT_CLAIM_COMMENT = """
 Ты — LegalFox. Дай краткий комментарий по кейсу претензии (6–12 строк).
-Без Markdown. Не задавай вопросов. Пиши как инструкцию. В конце: "Приложите копии: ...".
+Строго:
+- Без Markdown.
+- Не задавай вопросы.
+- Не используй символ '?'.
+- Пиши утверждениями/инструкциями.
+- В конце отдельная строка: "Приложите копии: ...".
 """
 
 PROMPT_CLAUSE = """
@@ -126,6 +141,7 @@ def _is_bad_value(v: Any) -> bool:
     low = s.lower()
     if low in ("none", "null", "undefined"):
         return True
+    # BotHelp плейсхолдеры вида "{%bh_user_id%}"
     if "{%" in s and "%}" in s and _PLACEHOLDER_RE.match(s):
         return True
     return False
@@ -161,10 +177,8 @@ def safe_filename(prefix: str) -> str:
 
 def pick_uid(payload: Dict[str, Any]) -> Tuple[str, str]:
     """
-    Самый частый источник поломки trial — UID.
-    Делает UID стабильным:
-      - игнорирует плейсхолдеры
-      - если есть цифры — берёт цифры (BotHelp/Telegram)
+    UID должен быть стабильным, иначе trial ломается.
+    Берём числовой id (если есть) — это самый надёжный вариант.
     """
     priority = [
         "bh_user_id",
@@ -175,10 +189,6 @@ def pick_uid(payload: Dict[str, Any]) -> Tuple[str, str]:
         "bothelp_user_id",
         "cuid",
     ]
-
-    cand = {k: (str(payload.get(k))[:80] if payload.get(k) is not None else None) for k in priority if k in payload}
-    if cand:
-        logger.info("UID candidates raw: %s", cand)
 
     for key in priority:
         if key not in payload:
@@ -226,8 +236,8 @@ def get_premium_flag(payload: Dict[str, Any]) -> bool:
 def get_with_file_requested(payload: Dict[str, Any], scenario: str) -> bool:
     """
     Без изменений BotHelp:
-    - если with_file есть — используем
-    - если with_file нет — для contract/claim считаем True (чтобы trial мог сработать)
+    - если with_file пришёл — используем его
+    - если with_file НЕ пришёл — для contract/claim считаем True
     """
     if "with_file" in payload:
         return normalize_bool(payload.get("with_file"))
@@ -239,14 +249,14 @@ def make_error_response(scenario: str, err: Optional[Exception] = None) -> Dict[
     msg = FALLBACK_TEXT
     if DEBUG_ERRORS and err is not None:
         msg += f"\n\n[DEBUG] {type(err).__name__}: {str(err)[:180]}"
-    return {"scenario": scenario, "reply_text": msg, "file_url": ""}
+    # Критично: всегда пустой file_url, чтобы BotHelp не подхватывал старый файл
+    return {"scenario": scenario, "reply_text": msg, "file_url": "", "pdf_url": "", "file": "", "document_url": ""}
 
 
 # ----------------- БД -----------------
 def _db_connect():
     con = sqlite3.connect(DB_PATH, timeout=20)
     cur = con.cursor()
-    # меньше шанс "database is locked"
     cur.execute("PRAGMA journal_mode=WAL;")
     cur.execute("PRAGMA synchronous=NORMAL;")
     return con
@@ -289,7 +299,9 @@ def free_left(uid: str) -> int:
     return int(row[0]) if row else 0
 
 def consume_free(uid: str) -> bool:
-    """Списываем trial только после успешной выдачи PDF."""
+    """
+    Trial списываем только после успешного создания PDF и URL.
+    """
     if not uid:
         return False
     ensure_user(uid)
@@ -474,11 +486,14 @@ async def call_llm(system_prompt: str, user_input: str, max_tokens: int = 1400) 
 
 
 # ----------------- FastAPI -----------------
-app = FastAPI(title="LegalFox API", version="1.7.7-trial-debug")
+app = FastAPI(title="LegalFox API", version="1.8.0-trial-link-guarantee")
 
 os.makedirs(FILES_DIR, exist_ok=True)
 app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
 db_init()
+
+if not PUBLIC_BASE_URL:
+    logger.warning("PUBLIC_BASE_URL is empty. Рекомендуется задать PUBLIC_BASE_URL в Railway.")
 
 
 @app.get("/")
@@ -488,8 +503,9 @@ async def root():
         "service": "LegalFox",
         "free_pdf_limit": FREE_PDF_LIMIT,
         "public_base_url": PUBLIC_BASE_URL or "",
-        "trial_debug": bool(TRIAL_DEBUG),
-        "db_path": DB_PATH,
+        "always_include_link_in_text": bool(ALWAYS_INCLUDE_LINK_IN_TEXT),
+        "model": GIGACHAT_MODEL,
+        "verify_ssl": bool(GIGACHAT_VERIFY_SSL),
     }
 
 
@@ -497,23 +513,26 @@ def file_url_for(filename: str, request: Request) -> str:
     if PUBLIC_BASE_URL:
         return f"{PUBLIC_BASE_URL}/files/{filename}"
 
-    # Railway обычно отдаёт forwarded headers — используем их
     proto = request.headers.get("x-forwarded-proto") or request.url.scheme or "https"
     host = request.headers.get("x-forwarded-host") or request.headers.get("host")
     if host:
-        # если внезапно http — поднимем до https (Railway обычно https снаружи)
         if proto == "http":
             proto = "https"
         return f"{proto}://{host}/files/{filename}"
 
-    # fallback (хуже, но лучше пустого)
     base = str(request.base_url).rstrip("/")
-    if base:
-        if base.startswith("http://"):
-            base = "https://" + base[len("http://"):]
-        return f"{base}/files/{filename}"
+    if base.startswith("http://"):
+        base = "https://" + base[len("http://"):]
+    return f"{base}/files/{filename}" if base else ""
 
-    return ""
+
+def build_pdf_reply(base_text: str, comment: str, url: str) -> str:
+    txt = base_text
+    if comment:
+        txt += f"\n\nКомментарий по вашему кейсу:\n{comment}"
+    if ALWAYS_INCLUDE_LINK_IN_TEXT and url:
+        txt += f"\n\nСкачать PDF:\n{url}"
+    return txt
 
 
 @app.post("/legalfox")
@@ -523,7 +542,7 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
 
     uid, uid_src = pick_uid(payload)
     if not uid:
-        return {"scenario": scenario, "reply_text": NO_UID_TEXT, "file_url": ""}
+        return {"scenario": scenario, "reply_text": NO_UID_TEXT, "file_url": "", "pdf_url": "", "file": "", "document_url": ""}
 
     ensure_user(uid)
 
@@ -540,6 +559,7 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
     )
 
     try:
+        # ----------------- CONTRACT -----------------
         if scenario == "contract":
             contract_type = payload.get("Тип договора") or payload.get("Тип_договора") or ""
             parties = payload.get("Стороны") or ""
@@ -562,57 +582,53 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
             comment = ""
             try:
                 comment = await call_llm(PROMPT_CONTRACT_COMMENT, user_text, max_tokens=420)
+                comment = comment.replace("?", "")  # страховка
             except Exception as e:
                 logger.warning("Comment generation failed (contract): %s", e)
 
+            # Если надо отдавать PDF (premium или trial)
             if with_file:
                 fn = safe_filename("contract")
                 out_path = os.path.join(FILES_DIR, fn)
                 render_pdf(draft, out_path, title="ДОГОВОР (ЧЕРНОВИК)")
 
                 if (not os.path.exists(out_path)) or (os.path.getsize(out_path) < 800):
-                    return {"scenario": "contract", "reply_text": FALLBACK_TEXT, "file_url": ""}
+                    return make_error_response("contract", RuntimeError("PDF not created"))
 
                 url = file_url_for(fn, request)
                 if not url:
-                    return {"scenario": "contract", "reply_text": URL_ERROR_TEXT, "file_url": ""}
+                    return {"scenario": "contract", "reply_text": URL_ERROR_TEXT, "file_url": "", "pdf_url": "", "file": "", "document_url": ""}
 
-                # Списываем trial после успешного URL
+                # Trial списываем строго после того, как URL уже сформирован
                 if (not premium) and trial_left > 0:
                     consume_free(uid)
 
-                txt = "Готово. Я подготовил черновик договора и приложил PDF-файл."
-                if comment:
-                    txt += f"\n\nКомментарий по вашему кейсу:\n{comment}"
-                if INCLUDE_FILE_LINK:
-                    txt += f"\n\nСкачать PDF:\n{url}"
-
-                if TRIAL_DEBUG:
-                    txt += (
-                        f"\n\n[TRIAL_DEBUG] uid={uid} ({uid_src}), premium={premium}, "
-                        f"trial_left_before={trial_left}, FREE_PDF_LIMIT={FREE_PDF_LIMIT}, "
-                        f"with_file_requested={with_file_requested}, with_file={with_file}, "
-                        f"public_base={PUBLIC_BASE_URL or 'AUTO'}"
-                    )
-
-                return {"scenario": "contract", "reply_text": txt, "file_url": url}
-
-            # Без файла
-            txt = draft + (f"\n\nКомментарий:\n{comment}" if comment else "")
-            if TRIAL_DEBUG:
-                txt += (
-                    f"\n\n[TRIAL_DEBUG] uid={uid} ({uid_src}), premium={premium}, "
-                    f"trial_left={trial_left}, FREE_PDF_LIMIT={FREE_PDF_LIMIT}, "
-                    f"with_file_requested={with_file_requested}, with_file={with_file}, "
-                    f"public_base={PUBLIC_BASE_URL or 'AUTO'}"
+                reply_text = build_pdf_reply(
+                    base_text="Готово. Я подготовил черновик договора и сформировал PDF-файл.",
+                    comment=comment,
+                    url=url,
                 )
+
+                # ВАЖНО: отдаём несколько полей-алиасов, чтобы BotHelp точно подхватил
+                return {
+                    "scenario": "contract",
+                    "reply_text": reply_text,
+                    "file_url": url,
+                    "pdf_url": url,
+                    "file": url,
+                    "document_url": url,
+                }
+
+            # Если PDF не разрешён (trial закончился)
+            txt = draft + (f"\n\nКомментарий:\n{comment}" if comment else "")
             if with_file_requested and (not premium) and trial_left <= 0:
                 txt += (
                     "\n\nPDF-документ доступен по подписке. "
                     "Пробный PDF уже использован — оформи подписку, чтобы получать PDF без ограничений."
                 )
-            return {"scenario": "contract", "reply_text": txt, "file_url": ""}
+            return {"scenario": "contract", "reply_text": txt, "file_url": "", "pdf_url": "", "file": "", "document_url": ""}
 
+        # ----------------- CLAIM -----------------
         if scenario == "claim":
             to_whom = payload.get("Адресат") or ""
             basis = payload.get("Основание") or ""
@@ -637,6 +653,7 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
             comment = ""
             try:
                 comment = await call_llm(PROMPT_CLAIM_COMMENT, user_text, max_tokens=420)
+                comment = comment.replace("?", "")  # страховка
             except Exception as e:
                 logger.warning("Comment generation failed (claim): %s", e)
 
@@ -646,54 +663,46 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 render_pdf(draft, out_path, title="ПРЕТЕНЗИЯ (ЧЕРНОВИК)")
 
                 if (not os.path.exists(out_path)) or (os.path.getsize(out_path) < 800):
-                    return {"scenario": "claim", "reply_text": FALLBACK_TEXT, "file_url": ""}
+                    return make_error_response("claim", RuntimeError("PDF not created"))
 
                 url = file_url_for(fn, request)
                 if not url:
-                    return {"scenario": "claim", "reply_text": URL_ERROR_TEXT, "file_url": ""}
+                    return {"scenario": "claim", "reply_text": URL_ERROR_TEXT, "file_url": "", "pdf_url": "", "file": "", "document_url": ""}
 
                 if (not premium) and trial_left > 0:
                     consume_free(uid)
 
-                txt = "Готово. Я подготовил черновик претензии и приложил PDF-файл."
-                if comment:
-                    txt += f"\n\nКомментарий по вашему кейсу:\n{comment}"
-                if INCLUDE_FILE_LINK:
-                    txt += f"\n\nСкачать PDF:\n{url}"
+                reply_text = build_pdf_reply(
+                    base_text="Готово. Я подготовил черновик претензии и сформировал PDF-файл.",
+                    comment=comment,
+                    url=url,
+                )
 
-                if TRIAL_DEBUG:
-                    txt += (
-                        f"\n\n[TRIAL_DEBUG] uid={uid} ({uid_src}), premium={premium}, "
-                        f"trial_left_before={trial_left}, FREE_PDF_LIMIT={FREE_PDF_LIMIT}, "
-                        f"with_file_requested={with_file_requested}, with_file={with_file}, "
-                        f"public_base={PUBLIC_BASE_URL or 'AUTO'}"
-                    )
-
-                return {"scenario": "claim", "reply_text": txt, "file_url": url}
+                return {
+                    "scenario": "claim",
+                    "reply_text": reply_text,
+                    "file_url": url,
+                    "pdf_url": url,
+                    "file": url,
+                    "document_url": url,
+                }
 
             txt = draft + (f"\n\nКомментарий:\n{comment}" if comment else "")
-            if TRIAL_DEBUG:
-                txt += (
-                    f"\n\n[TRIAL_DEBUG] uid={uid} ({uid_src}), premium={premium}, "
-                    f"trial_left={trial_left}, FREE_PDF_LIMIT={FREE_PDF_LIMIT}, "
-                    f"with_file_requested={with_file_requested}, with_file={with_file}, "
-                    f"public_base={PUBLIC_BASE_URL or 'AUTO'}"
-                )
             if with_file_requested and (not premium) and trial_left <= 0:
                 txt += (
                     "\n\nPDF-документ доступен по подписке. "
                     "Пробный PDF уже использован — оформи подписку, чтобы получать PDF без ограничений."
                 )
-            return {"scenario": "claim", "reply_text": txt, "file_url": ""}
+            return {"scenario": "claim", "reply_text": txt, "file_url": "", "pdf_url": "", "file": "", "document_url": ""}
 
-        # clause
+        # ----------------- CLAUSE -----------------
         q = payload.get("Запрос") or payload.get("query") or payload.get("Вопрос") or payload.get("Текст") or ""
         q = str(q).strip()
         if not q:
-            return {"scenario": "clause", "reply_text": "Напиши вопрос или вставь текст одним сообщением — помогу.", "file_url": ""}
+            return {"scenario": "clause", "reply_text": "Напиши вопрос или вставь текст одним сообщением — помогу.", "file_url": "", "pdf_url": "", "file": "", "document_url": ""}
 
         answer = await call_llm(PROMPT_CLAUSE, q, max_tokens=800)
-        return {"scenario": "clause", "reply_text": answer, "file_url": ""}
+        return {"scenario": "clause", "reply_text": answer, "file_url": "", "pdf_url": "", "file": "", "document_url": ""}
 
     except Exception as e:
         logger.exception("legalfox error: %s", e)
