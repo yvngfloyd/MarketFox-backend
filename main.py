@@ -4,7 +4,8 @@ import uuid
 import time
 import sqlite3
 import logging
-from typing import Any, Dict, Tuple, Optional
+import asyncio
+from typing import Any, Dict, Tuple, List, Optional
 
 import httpx
 from fastapi import FastAPI, Body, Request
@@ -30,11 +31,19 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 FILES_DIR = os.getenv("FILES_DIR", "files")
 DB_PATH = os.getenv("DB_PATH", "legalfox.db")
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+LLM_PROVIDER = (os.getenv("LLM_PROVIDER", "gigachat") or "gigachat").strip().lower()
+
+# GigaChat
+GIGACHAT_AUTH_KEY = os.getenv("GIGACHAT_AUTH_KEY")  # Basic <auth_key>
+GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
+GIGACHAT_MODEL = os.getenv("GIGACHAT_MODEL", "GigaChat")
+
+GIGACHAT_OAUTH_URL = os.getenv("GIGACHAT_OAUTH_URL", "https://ngw.devices.sberbank.ru:9443/api/v2/oauth")
+GIGACHAT_BASE_URL = os.getenv("GIGACHAT_BASE_URL", "https://gigachat.devices.sberbank.ru")
+GIGACHAT_VERIFY_SSL = (os.getenv("GIGACHAT_VERIFY_SSL", "1").strip() != "0")
 
 # 1 бесплатный PDF на пользователя
-FREE_PDF_LIMIT = int(os.getenv("FREE_PDF_LIMIT", "1"))  # оставь 1
+FREE_PDF_LIMIT = int(os.getenv("FREE_PDF_LIMIT", "1"))
 
 FALLBACK_TEXT = "Сейчас не могу обратиться к нейросети. Попробуй повторить чуть позже."
 
@@ -64,15 +73,9 @@ PROMPT_CONTRACT = """
 7) Суммы/сроки:
    - если сумма/срок не указаны — оставь понятное место: "___ рублей", "___ календарных дней"
    - не пиши случайные числа.
-8) Если "особые условия" содержат важные пункты (штрафы, порядок передачи, конфиденциальность, подсудность и т.д.) —
-   встрои их в соответствующие разделы.
-9) В конце:
-   - "Реквизиты и подписи сторон" с аккуратными полями.
-   - Для физлиц: ФИО, паспорт: ___, адрес: ___, телефон/email: ___
-   - Для юрлиц/ИП: наименование, ИНН/ОГРН(ОГРНИП): ___, адрес, р/с, банк, БИК, к/с: ___
-   Определи тип стороны по входным данным (если явно написано ООО/ИП — используй соответствующий блок).
-   Если непонятно — сделай универсально: "ФИО/Наименование: ___".
-10) Документ должен быть пригоден как черновик и выглядеть аккуратно: короткие абзацы, пустые строки между разделами.
+8) Если "особые условия" содержат важные пункты — встрои их в соответствующие разделы.
+9) В конце: "Реквизиты и подписи сторон" с полями. Ничего не выдумывай — если нет данных, "___".
+10) Аккуратная верстка: короткие абзацы, пустые строки между разделами.
 """
 
 PROMPT_CLAIM = """
@@ -104,8 +107,8 @@ PROMPT_CONTRACT_COMMENT = """
 Строго:
 - Без Markdown.
 - 6–10 коротких строк.
-- Пиши по делу: что важно проверить, какие данные лучше уточнить/добавить, где обычно бывают риски.
-- Если чего-то не хватает — прямо перечисли, что именно (например: цена, сроки, порядок приемки, ответственность, реквизиты).
+- По делу: что проверить, что уточнить/добавить, где риски.
+- Если чего-то не хватает — перечисли конкретно.
 - Не обещай результат и не выдавай себя за адвоката.
 """
 
@@ -116,8 +119,8 @@ PROMPT_CLAIM_COMMENT = """
 Строго:
 - Без Markdown.
 - 6–10 коротких строк.
-- Пиши по делу: что важно проверить, какие данные/доказательства добавить, какой срок указать, что приложить.
-- Если чего-то не хватает — перечисли конкретно (дата/сумма/договор/чеки/переписка/реквизиты/адресат).
+- По делу: что проверить, какие доказательства/данные добавить, какой срок указать, что приложить.
+- Если чего-то не хватает — перечисли конкретно.
 - Не обещай результат и не выдавай себя за адвоката.
 """
 
@@ -126,7 +129,7 @@ PROMPT_CLAUSE = """
 Нужно:
 - Ответить по-русски, по делу, без Markdown.
 - Если нужно — переформулировать текст юридически аккуратнее, сохранив смысл.
-- Делай структуру и отступы: короткие абзацы, пустые строки между блоками.
+- Короткие абзацы, пустые строки между блоками.
 - Не выдавай себя за адвоката и не обещай гарантированный исход.
 """
 
@@ -158,10 +161,7 @@ def safe_filename(prefix: str) -> str:
 
 
 def pick_uid(payload: Dict[str, Any]) -> Tuple[str, str]:
-    """
-    UID должен быть стабильным.
-    В BotHelp "cuid" может меняться — держим его последним.
-    """
+    # cuid — последним, чтобы UID не “скакал”
     priority = [
         "bh_user_id",
         "user_id",
@@ -261,11 +261,11 @@ def render_pdf(text: str, out_path: str, title: str):
     y = height - top - 30
     line_height = 14
 
-    def wrap_line(line: str) -> list[str]:
+    def wrap_line(line: str) -> List[str]:
         words = line.split()
         if not words:
             return [""]
-        lines = []
+        lines: List[str] = []
         cur = words[0]
         for w in words[1:]:
             test = cur + " " + w
@@ -297,30 +297,123 @@ def render_pdf(text: str, out_path: str, title: str):
     c.save()
 
 
-# ----------------- LLM -----------------
-async def call_groq(system_prompt: str, user_content: str, max_tokens: int = 1400) -> str:
-    if not GROQ_API_KEY:
-        raise RuntimeError("GROQ_API_KEY not set")
+# ----------------- GigaChat Token Cache -----------------
+_token_lock = asyncio.Lock()
+_token_value: Optional[str] = None
+_token_exp: float = 0.0  # epoch seconds
 
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+def _now() -> float:
+    return time.time()
+
+
+async def get_gigachat_access_token() -> str:
+    """
+    Получаем access_token (живет 30 минут).
+    Кэшируем и обновляем заранее (примерно за 5 минут до истечения).
+    """
+    global _token_value, _token_exp
+
+    if not GIGACHAT_AUTH_KEY:
+        raise RuntimeError("GIGACHAT_AUTH_KEY not set")
+
+    # быстрый путь без lock
+    if _token_value and _now() < (_token_exp - 60):
+        return _token_value
+
+    async with _token_lock:
+        # повторная проверка после lock
+        if _token_value and _now() < (_token_exp - 60):
+            return _token_value
+
+        rq_uid = str(uuid.uuid4())
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "RqUID": rq_uid,
+            "Authorization": f"Basic {GIGACHAT_AUTH_KEY}",
+        }
+        data = {"scope": GIGACHAT_SCOPE}
+
+        async with httpx.AsyncClient(timeout=60, verify=GIGACHAT_VERIFY_SSL) as client:
+            r = await client.post(GIGACHAT_OAUTH_URL, headers=headers, data=data)
+            r.raise_for_status()
+            js = r.json()
+
+        token = js.get("access_token")
+        if not token:
+            raise RuntimeError(f"OAuth ответ без access_token: {js}")
+
+        # По докам токен 30 минут. Ставим 25 минут, чтобы не ловить истечение.
+        _token_value = token
+        _token_exp = _now() + 25 * 60
+        logger.info("GigaChat token refreshed rq_uid=%s exp_in≈%ss", rq_uid, 25 * 60)
+        return _token_value
+
+
+async def call_gigachat(system_prompt: str, user_content: str, max_tokens: int = 1400) -> str:
+    token = await get_gigachat_access_token()
+    url = f"{GIGACHAT_BASE_URL}/api/v1/chat/completions"
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
     payload = {
-        "model": GROQ_MODEL,
+        "model": GIGACHAT_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt.strip()},
             {"role": "user", "content": user_content.strip()},
         ],
         "temperature": 0.25,
-        "max_tokens": max_tokens,
+        "max_tokens": int(max_tokens),
         "top_p": 1,
+        "stream": False,
     }
 
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=90, verify=True) as client:
         r = await client.post(url, headers=headers, json=payload)
+
+        # Если токен вдруг протух — обновим и повторим 1 раз
+        if r.status_code in (401, 403):
+            logger.warning("GigaChat auth error %s, refreshing token and retrying once", r.status_code)
+            # сброс кэша
+            global _token_value, _token_exp
+            _token_value, _token_exp = None, 0.0
+            token = await get_gigachat_access_token()
+            headers["Authorization"] = f"Bearer {token}"
+            r = await client.post(url, headers=headers, json=payload)
+
         r.raise_for_status()
-        data = r.json()
-        content = data["choices"][0]["message"]["content"]
-        return strip_markdown_noise(content)
+        js = r.json()
+
+    try:
+        content = js["choices"][0]["message"]["content"]
+    except Exception:
+        raise RuntimeError(f"Unexpected GigaChat response: {js}")
+
+    return strip_markdown_noise(content)
+
+
+async def call_llm(system_prompt: str, user_input: str, max_tokens: int = 1400) -> str:
+    if LLM_PROVIDER != "gigachat":
+        raise RuntimeError("LLM_PROVIDER must be gigachat for this main.py")
+    return await call_gigachat(system_prompt, user_input, max_tokens=max_tokens)
+
+
+# ----------------- FastAPI -----------------
+app = FastAPI(title="LegalFox API", version="1.5.0-gigachat")
+
+os.makedirs(FILES_DIR, exist_ok=True)
+app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
+
+db_init()
+
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "LegalFox", "llm": LLM_PROVIDER, "model": GIGACHAT_MODEL}
 
 
 def scenario_alias(s: str) -> str:
@@ -352,20 +445,6 @@ def file_url_for(filename: str, request: Request) -> str:
     return f"{base}/files/{filename}"
 
 
-# ----------------- FastAPI -----------------
-app = FastAPI(title="LegalFox API", version="1.3.0")
-
-os.makedirs(FILES_DIR, exist_ok=True)
-app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
-
-db_init()
-
-
-@app.get("/")
-async def root():
-    return {"status": "ok", "service": "LegalFox"}
-
-
 @app.post("/legalfox")
 async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
     scenario_raw = payload.get("scenario") or payload.get("Сценарий") or payload.get("сценарий") or "contract"
@@ -385,8 +464,8 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
     with_file = with_file_requested and can_file
 
     logger.info(
-        "Scenario=%s uid=%s(uid_src=%s) premium=%s trial_left=%s with_file_requested=%s with_file=%s",
-        scenario, uid, uid_src, premium, trial_left, with_file_requested, with_file
+        "Scenario=%s uid=%s(uid_src=%s) premium=%s trial_left=%s with_file_requested=%s with_file=%s model=%s",
+        scenario, uid, uid_src, premium, trial_left, with_file_requested, with_file, GIGACHAT_MODEL
     )
 
     try:
@@ -405,8 +484,8 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 f"Особые условия (как указано пользователем): {special or '___'}\n"
             ).strip()
 
-            draft = await call_groq(PROMPT_CONTRACT, user_text, max_tokens=1400)
-            comment = await call_groq(PROMPT_CONTRACT_COMMENT, user_text, max_tokens=420)
+            draft = await call_llm(PROMPT_CONTRACT, user_text, max_tokens=1400)
+            comment = await call_llm(PROMPT_CONTRACT_COMMENT, user_text, max_tokens=420)
 
             result: Dict[str, str] = {"scenario": "contract", "reply_text": ""}
 
@@ -419,28 +498,22 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                     consume_free(uid)
 
                 result["file_url"] = file_url_for(fn, request)
-
-                # ВАЖНО: без ссылки в тексте (чтобы не дублировалось)
                 result["reply_text"] = (
                     "Готово. Я подготовил черновик договора и приложил PDF-файл.\n\n"
-                    "Короткий комментарий по вашему запросу:\n"
+                    "Комментарий по вашему кейсу:\n"
                     f"{comment}"
                 )
             else:
-                # без PDF показываем текст договора + комментарий
                 result["reply_text"] = (
                     draft
-                    + "\n\n"
-                    + "Короткий комментарий:\n"
+                    + "\n\nКомментарий:\n"
                     + comment
                 )
-
                 if with_file_requested and (not premium) and trial_left <= 0:
                     result["reply_text"] += (
                         "\n\nPDF-документ доступен по подписке. "
                         "Пробный PDF уже использован — оформи подписку, чтобы получать PDF без ограничений."
                     )
-
             return result
 
         if scenario == "claim":
@@ -460,8 +533,8 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 f"Контакты: {contacts or '___'}\n"
             ).strip()
 
-            draft = await call_groq(PROMPT_CLAIM, user_text, max_tokens=1400)
-            comment = await call_groq(PROMPT_CLAIM_COMMENT, user_text, max_tokens=420)
+            draft = await call_llm(PROMPT_CLAIM, user_text, max_tokens=1400)
+            comment = await call_llm(PROMPT_CLAIM_COMMENT, user_text, max_tokens=420)
 
             result: Dict[str, str] = {"scenario": "claim", "reply_text": ""}
 
@@ -476,23 +549,20 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 result["file_url"] = file_url_for(fn, request)
                 result["reply_text"] = (
                     "Готово. Я подготовил черновик претензии и приложил PDF-файл.\n\n"
-                    "Короткий комментарий по вашему запросу:\n"
+                    "Комментарий по вашему кейсу:\n"
                     f"{comment}"
                 )
             else:
                 result["reply_text"] = (
                     draft
-                    + "\n\n"
-                    + "Короткий комментарий:\n"
+                    + "\n\nКомментарий:\n"
                     + comment
                 )
-
                 if with_file_requested and (not premium) and trial_left <= 0:
                     result["reply_text"] += (
                         "\n\nPDF-документ доступен по подписке. "
                         "Пробный PDF уже использован — оформи подписку, чтобы получать PDF без ограничений."
                     )
-
             return result
 
         # clause
@@ -501,7 +571,7 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
         if not q:
             return {"scenario": "clause", "reply_text": "Напиши вопрос или вставь текст одним сообщением — помогу исправить/улучшить."}
 
-        answer = await call_groq(PROMPT_CLAUSE, q, max_tokens=800)
+        answer = await call_llm(PROMPT_CLAUSE, q, max_tokens=800)
         return {"scenario": "clause", "reply_text": answer}
 
     except Exception as e:
