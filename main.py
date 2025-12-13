@@ -57,7 +57,6 @@ def _safe_int(name: str, default: int) -> int:
 
 FREE_PDF_LIMIT = max(0, _safe_int("FREE_PDF_LIMIT", 1))
 
-# Debug (по желанию)
 DEBUG_ERRORS = (os.getenv("DEBUG_ERRORS", "0").strip() == "1")
 
 # PDF layout
@@ -70,7 +69,7 @@ PDF_RIGHT_MM = float(os.getenv("PDF_RIGHT_MM", "15"))
 PDF_TOP_MM = float(os.getenv("PDF_TOP_MM", "20"))
 PDF_BOTTOM_MM = float(os.getenv("PDF_BOTTOM_MM", "20"))
 
-# ВАЖНО: чтобы не было дублей ссылок — по умолчанию НЕ вставляем URL в текст
+# Чтобы не было дублей ссылок — по умолчанию НЕ вставляем URL в текст
 ALWAYS_INCLUDE_LINK_IN_TEXT = (os.getenv("ALWAYS_INCLUDE_LINK_IN_TEXT", "0").strip() == "1")
 
 FALLBACK_TEXT = "Сейчас не могу обратиться к нейросети. Попробуй повторить чуть позже."
@@ -95,7 +94,6 @@ PROMPT_DRAFT_WITH_TEMPLATE = """
 Ниже будет ШАБЛОН и ДАННЫЕ ПОЛЬЗОВАТЕЛЯ.
 """
 
-# Комментарии — всегда на "ты"
 PROMPT_CONTRACT_COMMENT = """
 Ты — LegalFox. Дай краткий комментарий по договору (6–10 строк).
 
@@ -120,8 +118,12 @@ PROMPT_CLAIM_COMMENT = """
 """
 
 PROMPT_CLAUSE = """
-Ты — LegalFox. Ответь по-русски, по делу, без Markdown. Короткие абзацы.
+Ты — LegalFox. Пользователь прислал ситуацию или кусок текста.
+Ответь по-русски, по делу, без Markdown.
 Обращайся к пользователю на "ты".
+Не обещай гарантированный исход.
+Дай понятный план: что сделать сейчас, какие документы/шаги обычно нужны, куда обращаться.
+Короткие абзацы.
 """
 
 
@@ -227,7 +229,7 @@ def get_with_file_requested(payload: Dict[str, Any], scenario: str) -> bool:
         return normalize_bool(payload.get("with_file"))
     if scenario in ("contract", "claim"):
         return True
-    return get_premium_flag(payload)
+    return False
 
 def make_error_response(scenario: str, err: Optional[Exception] = None) -> Dict[str, str]:
     msg = FALLBACK_TEXT
@@ -508,7 +510,7 @@ async def call_llm(system_prompt: str, user_input: str, max_tokens: int = 1400) 
 
 
 # ----------------- FastAPI -----------------
-app = FastAPI(title="LegalFox API", version="2.0.1-templates-ty")
+app = FastAPI(title="LegalFox API", version="2.0.2-clause-no-uid")
 
 os.makedirs(FILES_DIR, exist_ok=True)
 app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
@@ -553,7 +555,6 @@ def build_pdf_reply(base_text: str, comment: str, url: str) -> str:
     txt = base_text
     if comment:
         txt += f"\n\nКомментарий по твоему кейсу:\n{comment}"
-    # По умолчанию НЕ добавляем ссылку в текст, чтобы не было дублей.
     if ALWAYS_INCLUDE_LINK_IN_TEXT and url:
         txt += f"\n\nСкачать PDF:\n{url}"
     return txt
@@ -564,6 +565,21 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
     scenario_raw = payload.get("scenario") or payload.get("Сценарий") or payload.get("сценарий") or "contract"
     scenario = scenario_alias(str(scenario_raw))
 
+    # ----------------- CLAUSE: UID НЕ НУЖЕН -----------------
+    if scenario == "clause":
+        q = payload.get("Запрос") or payload.get("query") or payload.get("Вопрос") or payload.get("Текст") or ""
+        q = str(q).strip()
+        if not q:
+            return {"scenario": "clause", "reply_text": "Напиши ситуацию или вставь текст одним сообщением — помогу.", "file_url": "", "pdf_url": "", "file": "", "document_url": ""}
+
+        try:
+            answer = await call_llm(PROMPT_CLAUSE, q, max_tokens=900)
+            return {"scenario": "clause", "reply_text": answer, "file_url": "", "pdf_url": "", "file": "", "document_url": ""}
+        except Exception as e:
+            logger.exception("clause error: %s", e)
+            return make_error_response("clause", e)
+
+    # ----------------- CONTRACT/CLAIM: UID НУЖЕН -----------------
     uid, uid_src = pick_uid(payload)
     if not uid:
         return {"scenario": scenario, "reply_text": NO_UID_TEXT, "file_url": "", "pdf_url": "", "file": "", "document_url": ""}
@@ -649,7 +665,6 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                     url=url,
                 )
 
-                # ВАЖНО: чтобы BotHelp не дублировал URL — заполняем только file_url.
                 return {
                     "scenario": "contract",
                     "reply_text": reply_text,
@@ -745,14 +760,8 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 )
             return {"scenario": "claim", "reply_text": txt, "file_url": "", "pdf_url": "", "file": "", "document_url": ""}
 
-        # ----------------- CLAUSE -----------------
-        q = payload.get("Запрос") or payload.get("query") or payload.get("Вопрос") or payload.get("Текст") or ""
-        q = str(q).strip()
-        if not q:
-            return {"scenario": "clause", "reply_text": "Напиши вопрос или вставь текст одним сообщением — помогу.", "file_url": "", "pdf_url": "", "file": "", "document_url": ""}
-
-        answer = await call_llm(PROMPT_CLAUSE, q, max_tokens=900)
-        return {"scenario": "clause", "reply_text": answer, "file_url": "", "pdf_url": "", "file": "", "document_url": ""}
+        # fallback
+        return {"scenario": scenario, "reply_text": "Неизвестный сценарий.", "file_url": "", "pdf_url": "", "file": "", "document_url": ""}
 
     except Exception as e:
         logger.exception("legalfox error: %s", e)
