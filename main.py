@@ -27,7 +27,7 @@ if not logger.handlers:
 
 
 # ----------------- Конфиг -----------------
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")  # поставь: https://legalfox.up.railway.app
 FILES_DIR = os.getenv("FILES_DIR", "files")
 DB_PATH = os.getenv("DB_PATH", "legalfox.db")
 
@@ -37,7 +37,6 @@ LLM_PROVIDER = (os.getenv("LLM_PROVIDER", "gigachat") or "gigachat").strip().low
 GIGACHAT_AUTH_KEY = os.getenv("GIGACHAT_AUTH_KEY")
 GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
 GIGACHAT_MODEL = os.getenv("GIGACHAT_MODEL", "GigaChat")
-
 GIGACHAT_OAUTH_URL = os.getenv("GIGACHAT_OAUTH_URL", "https://ngw.devices.sberbank.ru:9443/api/v2/oauth")
 GIGACHAT_BASE_URL = os.getenv("GIGACHAT_BASE_URL", "https://gigachat.devices.sberbank.ru")
 GIGACHAT_VERIFY_SSL = (os.getenv("GIGACHAT_VERIFY_SSL", "1").strip() != "0")
@@ -46,6 +45,7 @@ FREE_PDF_LIMIT = int(os.getenv("FREE_PDF_LIMIT", "1"))
 DEBUG_ERRORS = (os.getenv("DEBUG_ERRORS", "0").strip() == "1")
 
 FALLBACK_TEXT = "Сейчас не могу обратиться к нейросети. Попробуй повторить чуть позже."
+URL_ERROR_TEXT = "Техническая ошибка: не удалось сформировать публичную ссылку на PDF. Администратору нужно настроить PUBLIC_BASE_URL."
 
 
 # ----------------- Промты -----------------
@@ -134,7 +134,6 @@ PROMPT_CLAUSE = """
 _PLACEHOLDER_RE = re.compile(r"^\s*\{\%.*\%\}\s*$")
 
 def _is_bad_value(v: Any) -> bool:
-    """Отбрасываем пустое/None/null и плейсхолдеры BotHelp вида {%...%}."""
     if v is None:
         return True
     s = str(v).strip()
@@ -174,10 +173,6 @@ def safe_filename(prefix: str) -> str:
 
 
 def pick_uid(payload: Dict[str, Any]) -> Tuple[str, str]:
-    """
-    ВАЖНО: BotHelp иногда отправляет не значение, а строку-шаблон "{%bh_user_id%}".
-    Такое нужно игнорировать, иначе все пользователи становятся одним uid и trial “умирает”.
-    """
     priority = [
         "bh_user_id",
         "user_id",
@@ -187,8 +182,7 @@ def pick_uid(payload: Dict[str, Any]) -> Tuple[str, str]:
         "bothelp_user_id",
         "cuid",
     ]
-
-    # Лог кандидатов (с обрезкой), чтобы быстро диагностировать
+    # диагностируем кандидатов
     cand = {k: (str(payload.get(k))[:60] if payload.get(k) is not None else None) for k in priority if k in payload}
     if cand:
         logger.info("UID candidates: %s", cand)
@@ -200,7 +194,6 @@ def pick_uid(payload: Dict[str, Any]) -> Tuple[str, str]:
         if _is_bad_value(v):
             continue
         return str(v).strip(), key
-
     return "", ""
 
 
@@ -263,7 +256,6 @@ def free_left(uid: str) -> int:
 
 
 def try_reserve_trial(uid: str) -> bool:
-    """Атомарно списывает 1 триал. True только если реально списали."""
     if not uid:
         return False
     ensure_user(uid)
@@ -281,7 +273,6 @@ def try_reserve_trial(uid: str) -> bool:
 
 
 def refund_trial(uid: str):
-    """Возвращаем 1 триал, если списали, но PDF не выдали из-за ошибки."""
     if not uid:
         return
     con = sqlite3.connect(DB_PATH)
@@ -456,12 +447,15 @@ async def call_llm(system_prompt: str, user_input: str, max_tokens: int = 1400) 
 
 
 # ----------------- FastAPI -----------------
-app = FastAPI(title="LegalFox API", version="1.6.4-gigachat-uidfix")
+app = FastAPI(title="LegalFox API", version="1.6.5-urlfix")
 
 os.makedirs(FILES_DIR, exist_ok=True)
 app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
 
 db_init()
+
+if not PUBLIC_BASE_URL:
+    logger.warning("PUBLIC_BASE_URL is empty. Will try forwarded headers, but лучше задать PUBLIC_BASE_URL в Railway.")
 
 
 @app.get("/")
@@ -472,6 +466,7 @@ async def root():
         "llm": LLM_PROVIDER,
         "model": GIGACHAT_MODEL,
         "verify_ssl": bool(GIGACHAT_VERIFY_SSL),
+        "public_base_url": PUBLIC_BASE_URL or "",
         "free_pdf_limit": FREE_PDF_LIMIT,
     }
 
@@ -501,8 +496,22 @@ def get_with_file_requested(payload: Dict[str, Any]) -> bool:
 
 
 def file_url_for(filename: str, request: Request) -> str:
-    base = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
-    return f"{base}/files/{filename}"
+    # как раньше: явно заданный PUBLIC_BASE_URL
+    if PUBLIC_BASE_URL:
+        return f"{PUBLIC_BASE_URL}/files/{filename}"
+
+    # Railway/прокси: forwarded заголовки
+    proto = request.headers.get("x-forwarded-proto") or "https"
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+    if host:
+        return f"{proto}://{host}/files/{filename}"
+
+    return ""
+
+
+def reply_with_pdf_link(base_text: str, file_url: str) -> str:
+    # Без дублей: добавляем ссылку одной строкой
+    return f"{base_text}\n\nСкачать PDF:\n{file_url}"
 
 
 @app.post("/legalfox")
@@ -521,8 +530,8 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
 
     trial_snapshot = free_left(uid)
     logger.info(
-        "Scenario=%s uid=%s(uid_src=%s) premium=%s trial_left=%s with_file_requested=%s model=%s",
-        scenario, uid, uid_src, premium, trial_snapshot, with_file_requested, GIGACHAT_MODEL
+        "Scenario=%s uid=%s(uid_src=%s) premium=%s trial_left=%s with_file_requested=%s",
+        scenario, uid, uid_src, premium, trial_snapshot, with_file_requested
     )
 
     try:
@@ -561,22 +570,27 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
             can_send_pdf = with_file_requested and (premium or reserved_trial)
 
             if can_send_pdf:
-                try:
-                    fn = safe_filename("contract")
-                    out_path = os.path.join(FILES_DIR, fn)
-                    render_pdf(draft, out_path, title="ДОГОВОР (ЧЕРНОВИК)")
+                fn = safe_filename("contract")
+                out_path = os.path.join(FILES_DIR, fn)
+                render_pdf(draft, out_path, title="ДОГОВОР (ЧЕРНОВИК)")
 
-                    result["file_url"] = file_url_for(fn, request)
-                    result["reply_text"] = (
-                        "Готово. Я подготовил черновик договора и приложил PDF-файл."
-                        + (f"\n\nКомментарий по вашему кейсу:\n{comment}" if comment else "")
-                    )
-                    return result
-                except Exception as e:
+                url = file_url_for(fn, request)
+                if not url:
+                    # критично: если URL не можем сформировать — возвращаем триал и не врём про PDF
                     if reserved_trial and (not premium):
                         refund_trial(uid)
-                    raise e
+                    result["reply_text"] = URL_ERROR_TEXT
+                    result["file_url"] = ""
+                    return result
 
+                result["file_url"] = url
+                base_text = "Готово. Я подготовил черновик договора и приложил PDF-файл."
+                if comment:
+                    base_text += f"\n\nКомментарий по вашему кейсу:\n{comment}"
+                result["reply_text"] = reply_with_pdf_link(base_text, url)
+                return result
+
+            # без PDF
             result["reply_text"] = draft + (f"\n\nКомментарий:\n{comment}" if comment else "")
             if with_file_requested and (not premium) and (not reserved_trial):
                 result["reply_text"] += (
@@ -622,21 +636,24 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
             can_send_pdf = with_file_requested and (premium or reserved_trial)
 
             if can_send_pdf:
-                try:
-                    fn = safe_filename("claim")
-                    out_path = os.path.join(FILES_DIR, fn)
-                    render_pdf(draft, out_path, title="ПРЕТЕНЗИЯ (ЧЕРНОВИК)")
+                fn = safe_filename("claim")
+                out_path = os.path.join(FILES_DIR, fn)
+                render_pdf(draft, out_path, title="ПРЕТЕНЗИЯ (ЧЕРНОВИК)")
 
-                    result["file_url"] = file_url_for(fn, request)
-                    result["reply_text"] = (
-                        "Готово. Я подготовил черновик претензии и приложил PDF-файл."
-                        + (f"\n\nКомментарий по вашему кейсу:\n{comment}" if comment else "")
-                    )
-                    return result
-                except Exception as e:
+                url = file_url_for(fn, request)
+                if not url:
                     if reserved_trial and (not premium):
                         refund_trial(uid)
-                    raise e
+                    result["reply_text"] = URL_ERROR_TEXT
+                    result["file_url"] = ""
+                    return result
+
+                result["file_url"] = url
+                base_text = "Готово. Я подготовил черновик претензии и приложил PDF-файл."
+                if comment:
+                    base_text += f"\n\nКомментарий по вашему кейсу:\n{comment}"
+                result["reply_text"] = reply_with_pdf_link(base_text, url)
+                return result
 
             result["reply_text"] = draft + (f"\n\nКомментарий:\n{comment}" if comment else "")
             if with_file_requested and (not premium) and (not reserved_trial):
