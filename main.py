@@ -32,11 +32,10 @@ if not logger.handlers:
 
 
 # ----------------- Конфиг -----------------
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")  # лучше задать: https://legalfox.up.railway.app
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 FILES_DIR = os.getenv("FILES_DIR", "files")
 DB_PATH = os.getenv("DB_PATH", "legalfox.db")
 
-# Provider
 LLM_PROVIDER = (os.getenv("LLM_PROVIDER", "gigachat") or "gigachat").strip().lower()
 
 # GigaChat
@@ -128,6 +127,17 @@ def _is_bad_value(v: Any) -> bool:
     return False
 
 
+def _extract_digits(v: Any) -> str:
+    """Если в значении есть цифры — берём их (BotHelp/Telegram ID обычно числовые)."""
+    if v is None:
+        return ""
+    s = str(v).strip()
+    if not s:
+        return ""
+    digits = re.sub(r"\D+", "", s)
+    return digits
+
+
 def normalize_bool(v: Any) -> bool:
     if v is None:
         return False
@@ -154,8 +164,8 @@ def safe_filename(prefix: str) -> str:
 
 def pick_uid(payload: Dict[str, Any]) -> Tuple[str, str]:
     """
-    ВАЖНО: Trial будет работать только при стабильном UID.
-    Приоритет как раньше: bh_user_id → user_id → ... → cuid
+    Критично для trial: UID должен быть стабильный.
+    Берём числовой ID (если он есть) — это самый надёжный вариант.
     """
     priority = [
         "bh_user_id",
@@ -167,9 +177,10 @@ def pick_uid(payload: Dict[str, Any]) -> Tuple[str, str]:
         "cuid",
     ]
 
-    cand = {k: (str(payload.get(k))[:60] if payload.get(k) is not None else None) for k in priority if k in payload}
+    # логируем кандидатов
+    cand = {k: (str(payload.get(k))[:80] if payload.get(k) is not None else None) for k in priority if k in payload}
     if cand:
-        logger.info("UID candidates: %s", cand)
+        logger.info("UID candidates raw: %s", cand)
 
     for key in priority:
         if key not in payload:
@@ -177,7 +188,17 @@ def pick_uid(payload: Dict[str, Any]) -> Tuple[str, str]:
         v = payload.get(key)
         if _is_bad_value(v):
             continue
-        return str(v).strip(), key
+
+        digits = _extract_digits(v)
+        # если есть цифры — используем только цифры (стабильно)
+        if digits:
+            return digits, f"{key}:digits"
+
+        # иначе используем строку как есть
+        s = str(v).strip()
+        if s:
+            return s, key
+
     return "", ""
 
 
@@ -222,7 +243,10 @@ def ensure_user(uid: str):
         return
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    cur.execute("INSERT OR IGNORE INTO users(uid, free_pdf_left) VALUES(?, ?)", (uid, FREE_PDF_LIMIT))
+    cur.execute(
+        "INSERT OR IGNORE INTO users(uid, free_pdf_left) VALUES(?, ?)",
+        (uid, FREE_PDF_LIMIT),
+    )
     con.commit()
     con.close()
 
@@ -241,7 +265,7 @@ def free_left(uid: str) -> int:
 
 def consume_free(uid: str) -> bool:
     """
-    Списываем trial ТОЛЬКО когда PDF реально выдан (после успешного file_url).
+    Списываем trial ТОЛЬКО когда PDF реально создан и URL сформирован.
     """
     if not uid:
         return False
@@ -261,13 +285,6 @@ def consume_free(uid: str) -> bool:
 
 # ----------------- PDF Fonts -----------------
 def register_fonts():
-    """
-    Ожидаемые файлы в fonts/ (можно не все):
-      PTSerif-Regular.ttf / PTSerif-Bold.ttf
-      PTSans-Regular.ttf / PTSans-Bold.ttf
-      LiberationSerif-Regular.ttf / LiberationSerif-Bold.ttf
-      DejaVuSerif.ttf / DejaVuSerif-Bold.ttf
-    """
     font_map = [
         ("PTSerif", "fonts/PTSerif-Regular.ttf", "fonts/PTSerif-Bold.ttf"),
         ("PTSans", "fonts/PTSans-Regular.ttf", "fonts/PTSans-Bold.ttf"),
@@ -442,7 +459,7 @@ async def call_llm(system_prompt: str, user_input: str, max_tokens: int = 1400) 
 
 
 # ----------------- FastAPI -----------------
-app = FastAPI(title="LegalFox API", version="1.7.4-trial-back-to-old")
+app = FastAPI(title="LegalFox API", version="1.7.6-trial-hard-fix")
 
 os.makedirs(FILES_DIR, exist_ok=True)
 app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
@@ -484,18 +501,22 @@ def get_premium_flag(payload: Dict[str, Any]) -> bool:
     return False
 
 
-def get_with_file_requested(payload: Dict[str, Any]) -> bool:
-    # как было у тебя изначально: with_file=1 всегда просит файл
+def get_with_file_requested(payload: Dict[str, Any], scenario: str) -> bool:
+    """
+    Ключевой фикс без BotHelp:
+    - если with_file пришёл — используем его
+    - если with_file НЕ пришёл — для contract/claim считаем, что файл запрошен (как раньше “по умолчанию”)
+    """
     if "with_file" in payload:
         return normalize_bool(payload.get("with_file"))
+    if scenario in ("contract", "claim"):
+        return True
     return get_premium_flag(payload)
 
 
 def file_url_for(filename: str, request: Request) -> str:
-    # 1) как раньше: PUBLIC_BASE_URL
     if PUBLIC_BASE_URL:
         return f"{PUBLIC_BASE_URL}/files/{filename}"
-    # 2) прокси заголовки
     proto = request.headers.get("x-forwarded-proto") or "https"
     host = request.headers.get("x-forwarded-host") or request.headers.get("host")
     if host:
@@ -515,9 +536,9 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
     ensure_user(uid)
 
     premium = get_premium_flag(payload)
-    with_file_requested = get_with_file_requested(payload)
-
+    with_file_requested = get_with_file_requested(payload, scenario)
     trial_left = free_left(uid)
+
     can_file = premium or (trial_left > 0)
     with_file = with_file_requested and can_file
 
@@ -552,13 +573,9 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
             except Exception as e:
                 logger.warning("Comment generation failed (contract): %s", e)
 
-            result: Dict[str, str] = {"scenario": "contract", "reply_text": "", "file_url": ""}
-
             if with_file:
                 fn = safe_filename("contract")
                 out_path = os.path.join(FILES_DIR, fn)
-
-                # PDF
                 render_pdf(draft, out_path, title="ДОГОВОР (ЧЕРНОВИК)")
 
                 # sanity check
@@ -570,7 +587,7 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 if not url:
                     return {"scenario": "contract", "reply_text": URL_ERROR_TEXT, "file_url": ""}
 
-                # списываем trial только после успешного URL
+                # списываем trial ТОЛЬКО после успешного URL
                 if (not premium) and trial_left > 0:
                     consume_free(uid)
 
@@ -580,11 +597,8 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 if INCLUDE_FILE_LINK:
                     txt += f"\n\nСкачать PDF:\n{url}"
 
-                result["reply_text"] = txt
-                result["file_url"] = url
-                return result
+                return {"scenario": "contract", "reply_text": txt, "file_url": url}
 
-            # без файла
             txt = draft + (f"\n\nКомментарий:\n{comment}" if comment else "")
             if with_file_requested and (not premium) and trial_left <= 0:
                 txt += (
