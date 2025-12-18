@@ -17,9 +17,9 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 
-# =========================
-# ЛОГГЕР
-# =========================
+# =========================================================
+# LOGGER
+# =========================================================
 logger = logging.getLogger("legalfox")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
@@ -28,15 +28,19 @@ if not logger.handlers:
     logger.addHandler(handler)
 
 
-# =========================
-# КОНФИГ
-# =========================
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")  # https://xxx.up.railway.app
+# =========================================================
+# CONFIG
+# =========================================================
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")  # e.g. https://legalfox.up.railway.app
 FILES_DIR = os.getenv("FILES_DIR", "files")
 DB_PATH = os.getenv("DB_PATH", "legalfox.db")
 
 # Trial
 FREE_PDF_LIMIT = int(os.getenv("FREE_PDF_LIMIT", "1"))
+
+# Reply behavior
+INCLUDE_FILE_LINK_IN_TEXT = os.getenv("INCLUDE_FILE_LINK_IN_TEXT", "0").strip() == "1"
+DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "0").strip() == "1"
 
 # LLM: GigaChat
 LLM_PROVIDER = (os.getenv("LLM_PROVIDER", "gigachat") or "gigachat").strip().lower()
@@ -46,8 +50,13 @@ GIGACHAT_MODEL = os.getenv("GIGACHAT_MODEL", "GigaChat-2-Max")
 
 GIGACHAT_OAUTH_URL = os.getenv("GIGACHAT_OAUTH_URL", "https://ngw.devices.sberbank.ru:9443/api/v2/oauth")
 GIGACHAT_BASE_URL = os.getenv("GIGACHAT_BASE_URL", "https://gigachat.devices.sberbank.ru")
-# В Railway при CERTIFICATE_VERIFY_FAILED поставь 0
+
+# If Railway SSL chain errors: set GIGACHAT_VERIFY_SSL=0
 GIGACHAT_VERIFY_SSL = (os.getenv("GIGACHAT_VERIFY_SSL", "1").strip() != "0")
+
+# Timeouts / retries
+LLM_TIMEOUT_SEC = int(os.getenv("LLM_TIMEOUT_SEC", "90"))
+LLM_RETRY_ON_CONNECT_ERR = os.getenv("LLM_RETRY_ON_CONNECT_ERR", "1").strip() == "1"
 
 FALLBACK_TEXT = "Сейчас не могу обратиться к нейросети. Попробуй повторить чуть позже."
 
@@ -58,10 +67,10 @@ COMMON_TAIL_TEMPLATE = os.getenv("COMMON_TAIL_TEMPLATE", "common_contract_tail_8
 COMMON_TAIL_PLACEHOLDER = os.getenv("COMMON_TAIL_PLACEHOLDER", "{{COMMON_CONTRACT_TAIL}}")
 
 
-# =========================
-# ПРОМТЫ
-# =========================
-PROMPT_DRAFT_WITH_TEMPLATE = """
+# =========================================================
+# PROMPTS
+# =========================================================
+PROMPT_DRAFT_WITH_TEMPLATE_AND_COMMENT = """
 Ты — LegalFox. Ты готовишь черновик договора оказания услуг по праву РФ для самозанятых/фрилансеров/микробизнеса.
 
 Тебе дан ШАБЛОН документа (строгая структура) и ДАННЫЕ пользователя.
@@ -91,21 +100,24 @@ PROMPT_DRAFT_WITH_TEMPLATE = """
      или оно выглядит как пример из инструкции — НЕ вставляй, оставь подчёркивания.
    - Если текст слишком общий и не даёт факта (например: "как договоримся", "потом", "не важно") — не вставляй как данные,
      оставь подчёркивания и сформулируй нейтрально.
-8) Используй введённые данные максимально конкретно, но только если они выглядят реальными:
-   - ФИО/название: нормальные слова, без "СТОРОНА_1"
-   - сроки: дата/период/этапы в понятном виде
-   - оплата: сумма и/или порядок оплаты понятным текстом
-   - приёмка: "акт" и/или "срок возражений" понятным текстом
-9) "Доп данные":
-   - Если там есть конкретные условия (правки, исходники, сроки оплаты, коммуникации, передача прав) — вставь 1–3 предложения в подходящий раздел.
-   - Если там мусор/вода/не относится к договору — игнорируй и оставь подчёркивания, не цитируй это в договоре.
-10) Верстка: короткие абзацы, пустые строки между разделами.
+8) "Доп данные":
+   - Если там есть конкретные условия — вставь 1–3 предложения в подходящий раздел.
+   - Если там мусор/вода/не относится к договору — игнорируй это полностью.
+
+Дополнительно: после договора сделай короткий комментарий (чек-лист) 5–8 строк.
+- Обращайся к пользователю на "ты".
+- Без вопросительных предложений и без символа '?'.
+- Нейтрально: "Проверь…", "Укажи…", "Добавь…", "Зафиксируй…".
 
 Формат входа:
 - TEMPLATE: текст шаблона
 - DATA: данные пользователя
 
-Выводи только финальный текст договора.
+Формат вывода (строго):
+<<<DOC>>>
+(текст договора)
+<<<COMMENT>>>
+(чек-лист)
 """
 
 PROMPT_CLAIM = """
@@ -152,9 +164,9 @@ PROMPT_CLAUSE = """
 """
 
 
-# =========================
-# УТИЛИТЫ
-# =========================
+# =========================================================
+# UTILITIES
+# =========================================================
 def normalize_bool(v: Any) -> bool:
     if v is None:
         return False
@@ -189,6 +201,7 @@ def pick_uid(payload: Dict[str, Any]) -> Tuple[str, str]:
         v = str(v).strip()
         if not v:
             continue
+        # Normalize: prefer digits-only if present (stable for BotHelp)
         digits = re.sub(r"\D+", "", v)
         if digits:
             return digits, f"{key}:digits"
@@ -204,15 +217,34 @@ def get_premium_flag(payload: Dict[str, Any]) -> bool:
 
 
 def get_with_file_requested(payload: Dict[str, Any]) -> bool:
-    # В BotHelp ты шлёшь with_file="1" всегда — так и задумано.
+    # BotHelp: with_file="1" always (by your design)
     if "with_file" in payload:
         return normalize_bool(payload.get("with_file"))
     return False
 
 
-def file_url_for(filename: str, request: Request) -> str:
-    base = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
-    return f"{base}/files/{filename}"
+def scenario_alias(s: str) -> str:
+    s = (s or "").strip().lower()
+    if s in ("contract", "draft_contract", "договора", "договора_черновик"):
+        return "contract"
+    if s in ("claim", "draft_claim", "претензия", "претензии", "claim_unpaid"):
+        return "claim"
+    if s in ("clause", "ask", "help", "пункты", "правки"):
+        return "clause"
+    return "contract"
+
+
+def extract_extra(payload: Dict[str, Any]) -> str:
+    extra = (
+        payload.get("Доп данные")
+        or payload.get("Доп_данные")
+        or payload.get("Доп вопросы")
+        or payload.get("Доп_вопросы")
+        or payload.get("extra")
+        or payload.get("Extra")
+        or ""
+    )
+    return str(extra).strip()
 
 
 def sanitize_comment(text: str) -> str:
@@ -234,35 +266,55 @@ def sanitize_comment(text: str) -> str:
     ]
     for p in banned:
         t = re.sub(re.escape(p), "", t, flags=re.IGNORECASE).strip()
+    # лишние пустые строки
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
     return t
 
 
-def extract_extra(payload: Dict[str, Any]) -> str:
-    # Ты используешь "Доп данные" — поддерживаем и вариации
-    extra = (
-        payload.get("Доп данные")
-        or payload.get("Доп_данные")
-        or payload.get("extra")
-        or payload.get("Extra")
-        or ""
-    )
-    return str(extra).strip()
+def split_doc_and_comment(text: str) -> Tuple[str, str]:
+    if not text:
+        return "", ""
+    doc_marker = "<<<DOC>>>"
+    com_marker = "<<<COMMENT>>>"
+    if doc_marker in text and com_marker in text:
+        after_doc = text.split(doc_marker, 1)[1]
+        doc_part, com_part = after_doc.split(com_marker, 1)
+        return doc_part.strip(), com_part.strip()
+    return text.strip(), ""
 
 
-def scenario_alias(s: str) -> str:
-    s = (s or "").strip().lower()
-    if s in ("contract", "draft_contract", "договора", "договора_черновик"):
-        return "contract"
-    if s in ("claim", "draft_claim", "претензия", "претензии", "claim_unpaid"):
-        return "claim"
-    if s in ("clause", "ask", "help", "пункты", "правки"):
-        return "clause"
-    return "contract"
+def get_public_base_url(request: Request) -> str:
+    """
+    Robust base-url builder (Railway/Reverse-proxy safe).
+    Prefers PUBLIC_BASE_URL if set. Otherwise uses X-Forwarded-* headers.
+    """
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+
+    xf_proto = request.headers.get("x-forwarded-proto")
+    xf_host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+    if xf_proto and xf_host:
+        return f"{xf_proto}://{xf_host}".rstrip("/")
+
+    return str(request.base_url).rstrip("/")
 
 
-# =========================
-# БД (TRIAL)
-# =========================
+def file_url_for(filename: str, request: Request) -> str:
+    base = get_public_base_url(request)
+    return f"{base}/files/{filename}"
+
+
+def error_reply(scenario: str, err: Optional[Exception] = None) -> Dict[str, str]:
+    msg = FALLBACK_TEXT
+    if DEBUG_ERRORS and err is not None:
+        msg += f"\n\n[DEBUG] {type(err).__name__}: {str(err)[:220]}"
+    # Critical: file_url must be empty, so BotHelp never attaches an old file.
+    return {"scenario": scenario, "reply_text": msg, "file_url": ""}
+
+
+# =========================================================
+# DB (TRIAL)
+# =========================================================
 def db_init():
     con = sqlite3.connect(DB_PATH, timeout=30)
     cur = con.cursor()
@@ -301,29 +353,26 @@ def free_left(uid: str) -> int:
     return int(row[0]) if row else 0
 
 
-def consume_free(uid: str) -> bool:
+def consume_free_atomic(uid: str) -> bool:
+    """
+    Atomic decrement to avoid double-spend on double-click / parallel requests.
+    """
     if not uid:
         return False
     ensure_user(uid)
     con = sqlite3.connect(DB_PATH, timeout=30)
     cur = con.cursor()
-    cur.execute("SELECT free_pdf_left FROM users WHERE uid=?", (uid,))
-    row = cur.fetchone()
-    left = int(row[0]) if row else 0
-    if left <= 0:
-        con.close()
-        return False
-    cur.execute("UPDATE users SET free_pdf_left = free_pdf_left - 1 WHERE uid=?", (uid,))
+    cur.execute("UPDATE users SET free_pdf_left = free_pdf_left - 1 WHERE uid=? AND free_pdf_left > 0", (uid,))
+    ok = (cur.rowcount or 0) > 0
     con.commit()
     con.close()
-    return True
+    return ok
 
 
-# =========================
-# PDF (кириллица)
-# =========================
+# =========================================================
+# PDF
+# =========================================================
 def ensure_font_name() -> str:
-    # Положи любой из этих шрифтов в fonts/
     candidates = [
         ("PTSerif", os.path.join("fonts", "PTSerif-Regular.ttf")),
         ("DejaVuSans", os.path.join("fonts", "DejaVuSans.ttf")),
@@ -334,7 +383,7 @@ def ensure_font_name() -> str:
                 pdfmetrics.registerFont(TTFont(font_name, font_path))
                 return font_name
         except Exception:
-            logger.exception("Не удалось зарегистрировать шрифт: %s", font_path)
+            logger.exception("Font register failed: %s", font_path)
     return "Helvetica"
 
 
@@ -343,8 +392,8 @@ def render_pdf(text: str, out_path: str, title: str):
     c = canvas.Canvas(out_path, pagesize=A4)
     width, height = A4
 
-    # Поля ~ ГОСТ-лайк
-    left, right, top, bottom = 85, 42, 57, 57  # ~30мм/15мм/20мм/20мм
+    # Approx ГОСТ-ish margins
+    left, right, top, bottom = 85, 42, 57, 57
     max_width = width - left - right
 
     c.setFont(font_name, 14)
@@ -390,9 +439,9 @@ def render_pdf(text: str, out_path: str, title: str):
     c.save()
 
 
-# =========================
-# TEMPLATES (cache)
-# =========================
+# =========================================================
+# TEMPLATES (CACHE)
+# =========================================================
 _templates_cache: Dict[str, str] = {}
 _templates_lock = asyncio.Lock()
 
@@ -427,9 +476,9 @@ async def build_services_contract_template() -> str:
     return base.replace(COMMON_TAIL_PLACEHOLDER, tail)
 
 
-# =========================
+# =========================================================
 # GIGACHAT TOKEN CACHE
-# =========================
+# =========================================================
 _token_lock = asyncio.Lock()
 _token_value: Optional[str] = None
 _token_exp: float = 0.0
@@ -498,14 +547,28 @@ async def call_gigachat(system_prompt: str, user_content: str, max_tokens: int =
         "stream": False,
     }
 
-    async with httpx.AsyncClient(timeout=90, verify=GIGACHAT_VERIFY_SSL) as client:
-        r = await client.post(url, headers=headers, json=payload)
+    async def _post_once(client: httpx.AsyncClient) -> httpx.Response:
+        return await client.post(url, headers=headers, json=payload)
+
+    async with httpx.AsyncClient(timeout=LLM_TIMEOUT_SEC, verify=GIGACHAT_VERIFY_SSL) as client:
+        try:
+            r = await _post_once(client)
+        except httpx.ConnectError as e:
+            if LLM_RETRY_ON_CONNECT_ERR:
+                logger.warning("GigaChat ConnectError, retry once: %s", e)
+                await asyncio.sleep(0.6)
+                r = await _post_once(client)
+            else:
+                raise
+
+        # Token expired: refresh once
         if r.status_code in (401, 403):
+            logger.warning("GigaChat auth error %s, refreshing token and retrying once", r.status_code)
             global _token_value, _token_exp
             _token_value, _token_exp = None, 0.0
             token = await get_gigachat_access_token()
             headers["Authorization"] = f"Bearer {token}"
-            r = await client.post(url, headers=headers, json=payload)
+            r = await _post_once(client)
 
         r.raise_for_status()
         js = r.json()
@@ -524,15 +587,18 @@ async def call_llm(system_prompt: str, user_input: str, max_tokens: int = 1400) 
     return await call_gigachat(system_prompt, user_input, max_tokens=max_tokens)
 
 
-# =========================
-# DATA BUILDER (минимальные поля)
-# =========================
+# =========================================================
+# DATA BUILDER (MINIMAL FIELDS)
+# =========================================================
 def build_services_data_min(payload: Dict[str, Any]) -> str:
-    # Минимальная схема, которую ты сделал:
-    # exec_type, exec_name, client_name, service_desc, deadline_value, price_value, acceptance_value, "Доп данные"
     def v(x: Any) -> str:
         s = str(x).strip()
-        return s if s else "___"
+        if not s:
+            return "___"
+        low = s.lower()
+        if low in ("нет", "не знаю", "пусто", "-", "—", "0", "n/a", "na"):
+            return "___"
+        return s
 
     exec_type = payload.get("exec_type") or ""
     exec_name = payload.get("exec_name") or ""
@@ -562,15 +628,18 @@ def build_services_data_min(payload: Dict[str, Any]) -> str:
     return data.strip()
 
 
-# =========================
+# =========================================================
 # FASTAPI
-# =========================
-app = FastAPI(title="LegalFox API", version="3.0.0-minimal-fields")
+# =========================================================
+app = FastAPI(title="LegalFox API", version="3.2.0-robust")
 
 os.makedirs(FILES_DIR, exist_ok=True)
 app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
 
 db_init()
+
+if not PUBLIC_BASE_URL:
+    logger.warning("PUBLIC_BASE_URL is not set. Recommended to set it (e.g. https://legalfox.up.railway.app).")
 
 
 @app.get("/")
@@ -581,6 +650,7 @@ async def root():
         "model": GIGACHAT_MODEL,
         "verify_ssl": bool(GIGACHAT_VERIFY_SSL),
         "free_pdf_limit": FREE_PDF_LIMIT,
+        "include_file_link_in_text": bool(INCLUDE_FILE_LINK_IN_TEXT),
         "templates_dir": TEMPLATES_DIR,
         "services_template": SERVICES_CONTRACT_TEMPLATE,
         "common_tail": COMMON_TAIL_TEMPLATE,
@@ -592,7 +662,7 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
     scenario_raw = payload.get("scenario") or payload.get("Сценарий") or payload.get("сценарий") or "contract"
     scenario = scenario_alias(str(scenario_raw))
 
-    # 3 функция: правки (может быть без uid)
+    # ========= CLAUSE (no trial) =========
     if scenario == "clause":
         q = payload.get("Запрос") or payload.get("query") or payload.get("Вопрос") or payload.get("Текст") or ""
         q = str(q).strip()
@@ -603,9 +673,9 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
             return {"scenario": "clause", "reply_text": answer, "file_url": ""}
         except Exception as e:
             logger.exception("legalfox error (clause): %s", e)
-            return {"scenario": "clause", "reply_text": FALLBACK_TEXT, "file_url": ""}
+            return error_reply("clause", e)
 
-    # Документы: нужен uid для trial
+    # ========= DOCUMENTS: need uid for trial =========
     uid, uid_src = pick_uid(payload)
     if not uid:
         return {"scenario": scenario, "reply_text": "Техническая ошибка: не удалось определить пользователя (bh_user_id/user_id).", "file_url": ""}
@@ -620,31 +690,23 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
     with_file = with_file_requested and can_file
 
     logger.info(
-        "Scenario=%s uid=%s(uid_src=%s) premium=%s trial_left=%s FREE_PDF_LIMIT=%s with_file_requested=%s with_file=%s",
-        scenario, uid, uid_src, premium, trial_left, FREE_PDF_LIMIT, with_file_requested, with_file
+        "Scenario=%s uid=%s(uid_src=%s) premium=%s trial_left=%s FREE_PDF_LIMIT=%s with_file_requested=%s with_file=%s model=%s",
+        scenario, uid, uid_src, premium, trial_left, FREE_PDF_LIMIT, with_file_requested, with_file, GIGACHAT_MODEL
     )
 
     try:
-        # ============ CONTRACT (услуги, минимальные поля) ============
+        # ========= CONTRACT (services, minimal fields, template) =========
         if scenario == "contract":
-            # 0) Собираем шаблон
             template_text = await build_services_contract_template()
-
-            # 1) DATA
             data_text = build_services_data_min(payload)
+
             llm_user_msg = f"TEMPLATE:\n{template_text}\n\nDATA:\n{data_text}\n"
+            full = await call_llm(PROMPT_DRAFT_WITH_TEMPLATE_AND_COMMENT, llm_user_msg, max_tokens=2000)
+            draft, comment = split_doc_and_comment(full)
+            comment = sanitize_comment(comment)
 
-            # 2) Сначала текст договора (если LLM упал — PDF не делаем)
-            draft = await call_llm(PROMPT_DRAFT_WITH_TEMPLATE, llm_user_msg, max_tokens=1900)
-
-            # 3) Комментарий (не обязателен)
-            comment = ""
-            try:
-                comment = await call_llm(PROMPT_CONTRACT_COMMENT, data_text, max_tokens=420)
-                comment = sanitize_comment(comment)
-            except Exception as e:
-                logger.warning("Comment generation failed (contract): %s", e)
-                comment = ""
+            if not draft:
+                raise RuntimeError("LLM returned empty draft")
 
             result: Dict[str, str] = {"scenario": "contract", "reply_text": "", "file_url": ""}
 
@@ -653,21 +715,26 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 out_path = os.path.join(FILES_DIR, fn)
                 render_pdf(draft, out_path, title="ДОГОВОР ОКАЗАНИЯ УСЛУГ (ЧЕРНОВИК)")
 
-                # Важно: ссылку НЕ дублируем в тексте — BotHelp прикрепит файл по file_url
-                result["file_url"] = file_url_for(fn, request)
+                url = file_url_for(fn, request)
+                result["file_url"] = url
 
-                # Trial списываем только если реально выдали PDF
+                # Spend trial only if PDF actually produced and returned
                 if (not premium) and trial_left > 0:
-                    ok = consume_free(uid)
+                    ok = consume_free_atomic(uid)
                     logger.info("Trial consume uid=%s ok=%s", uid, ok)
 
                 txt = "Готово. Я подготовил черновик договора и прикрепил PDF ниже."
+                if INCLUDE_FILE_LINK_IN_TEXT:
+                    txt += f"\nСкачать PDF: {url}"
                 if comment:
                     txt += f"\n\nКомментарий по твоему кейсу:\n{comment}"
+
                 result["reply_text"] = txt
+
+                logger.info("PDF ready uid=%s file=%s url=%s", uid, fn, url)
                 return result
 
-            # без файла (либо trial исчерпан, либо with_file=0)
+            # No file
             txt = draft
             if comment:
                 txt += f"\n\nКомментарий по твоему кейсу:\n{comment}"
@@ -675,7 +742,7 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 txt += "\n\nПробный PDF уже использован. Подписка даёт неограниченные PDF и повторную сборку."
             return {"scenario": "contract", "reply_text": txt, "file_url": ""}
 
-        # ============ CLAIM (оставляем совместимость) ============
+        # ========= CLAIM (compatible) =========
         if scenario == "claim":
             def v(x: Any) -> str:
                 s = str(x).strip()
@@ -714,17 +781,20 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 out_path = os.path.join(FILES_DIR, fn)
                 render_pdf(draft, out_path, title="ПРЕТЕНЗИЯ (ЧЕРНОВИК)")
 
-                file_url = file_url_for(fn, request)
+                url = file_url_for(fn, request)
 
                 if (not premium) and trial_left > 0:
-                    ok = consume_free(uid)
+                    ok = consume_free_atomic(uid)
                     logger.info("Trial consume uid=%s ok=%s", uid, ok)
 
                 txt = "Готово. Я подготовил черновик претензии и прикрепил PDF ниже."
+                if INCLUDE_FILE_LINK_IN_TEXT:
+                    txt += f"\nСкачать PDF: {url}"
                 if comment:
                     txt += f"\n\nКомментарий по твоему кейсу:\n{comment}"
 
-                return {"scenario": "claim", "reply_text": txt, "file_url": file_url}
+                logger.info("PDF ready uid=%s file=%s url=%s", uid, fn, url)
+                return {"scenario": "claim", "reply_text": txt, "file_url": url}
 
             txt = draft
             if comment:
@@ -733,10 +803,11 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 txt += "\n\nПробный PDF уже использован. Подписка даёт неограниченные PDF и повторную сборку."
             return {"scenario": "claim", "reply_text": txt, "file_url": ""}
 
-        # неизвестно
         return {"scenario": scenario, "reply_text": "Неизвестный сценарий.", "file_url": ""}
 
+    except FileNotFoundError as e:
+        logger.exception("Template error: %s", e)
+        return {"scenario": scenario, "reply_text": "Техническая ошибка: не найден шаблон документа на сервере. Сообщи администратору бота.", "file_url": ""}
     except Exception as e:
         logger.exception("legalfox error: %s", e)
-        # КРИТИЧНО: file_url всегда пустой при ошибках (чтобы BotHelp не прикреплял старый файл)
-        return {"scenario": scenario, "reply_text": FALLBACK_TEXT, "file_url": ""}
+        return error_reply(scenario, e)
