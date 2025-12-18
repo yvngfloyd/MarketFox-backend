@@ -881,7 +881,7 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
 
             return {
                 "scenario": "template_save",
-                "reply_text": f"Сохранил. Шаблон «{template_name}» записан в слот {used_slot}.",
+                "reply_text": f"Шаблон «{template_name}» сохранен! {used_slot} в списке.",
                 "file_url": ""
             }
 
