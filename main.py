@@ -2,6 +2,7 @@ import os
 import re
 import uuid
 import time
+import json
 import sqlite3
 import logging
 import asyncio
@@ -50,12 +51,14 @@ GIGACHAT_VERIFY_SSL = (os.getenv("GIGACHAT_VERIFY_SSL", "1").strip() != "0")
 
 FALLBACK_TEXT = "Сейчас не могу обратиться к нейросети. Попробуй повторить чуть позже."
 
-# Templates
+# Templates (файлы-шаблоны договора)
 TEMPLATES_DIR = os.getenv("TEMPLATES_DIR", "templates")
 SERVICES_CONTRACT_TEMPLATE = os.getenv("SERVICES_CONTRACT_TEMPLATE", "contract_services_v1.txt")
 COMMON_TAIL_TEMPLATE = os.getenv("COMMON_TAIL_TEMPLATE", "common_contract_tail_8_12.txt")
 COMMON_TAIL_PLACEHOLDER = os.getenv("COMMON_TAIL_PLACEHOLDER", "{{COMMON_CONTRACT_TAIL}}")
-USER_TEMPLATES_LIMIT = int(os.getenv("USER_TEMPLATES_LIMIT", "3"))  # лимит слотов 1..3
+
+# Лимит пользовательских шаблонов
+MAX_USER_TEMPLATES = int(os.getenv("MAX_USER_TEMPLATES", "3"))  # слоты 1..3
 
 
 # =========================
@@ -68,7 +71,7 @@ PROMPT_DRAFT_WITH_TEMPLATE = """
 Сгенерируй итоговый документ СТРОГО по шаблону: сохраняй порядок разделов, заголовки и нумерацию.
 
 Жёсткие правила:
-1) Без Markdown: никаких #, **, ``` и т.п.
+1) Без Markdown.
 2) Ничего не выдумывай: паспорт, ИНН/ОГРН, адреса, реквизиты, суммы, даты, сроки — только если пользователь дал явно и однозначно.
 3) Если данных нет / они неполные / размытые / противоречивые / выглядят как “мусор” — НЕ вставляй их.
    Вместо этого оставляй ПУСТОЕ МЕСТО длинными подчёркиваниями.
@@ -76,13 +79,11 @@ PROMPT_DRAFT_WITH_TEMPLATE = """
    - короткие поля: "____________"
    - длинные поля: "________________________________________"
    - суммы/даты: "________ руб.", "__.__.____"
-4) Никогда не используй заглушки типа "СТОРОНА_1", "АДРЕС_1", "ПРЕДМЕТ" и т.п.
-5) Не выводи служебные строки: "TEMPLATE:", "DATA:" и т.п.
-6) Если пользователь написал "нет" / "не знаю" / "пусто" / "—" / "0" / "n/a" — данных нет → подчёркивания.
-7) Жёсткая фильтрация мусора:
-   - тех. теги, переменные, набор букв/цифр без смысла — игнорируй, оставь подчёркивания.
-8) "Доп данные": если есть конкретные условия — вставь 1–3 предложения в подходящий раздел. Если вода/мусор — игнорируй.
-9) Верстка: короткие абзацы, пустые строки между разделами.
+4) Никогда не используй "СТОРОНА_1", "АДРЕС_1" и т.п.
+5) Не выводи служебные строки: "TEMPLATE:", "DATA:", "поле", "пример" и т.п.
+6) Если пользователь написал "нет" / "не знаю" / "пусто" / "—" / "0" / "n/a" — считай, что данных нет → подчёркивания.
+7) Доп. данные: если есть конкретика — вставь 1–3 предложения в подходящий раздел; мусор игнорируй.
+8) Верстка: короткие абзацы, пустые строки между разделами.
 
 Формат входа:
 - TEMPLATE: текст шаблона
@@ -92,17 +93,14 @@ PROMPT_DRAFT_WITH_TEMPLATE = """
 """
 
 PROMPT_CONTRACT_COMMENT = """
-Ты — LegalFox. Дай короткий комментарий к договору (чек-лист).
+Ты — LegalFox. Дай короткий комментарий (чек-лист) по договору на основе введённых данных.
 
 Строго:
 - Без Markdown.
-- Обращайся к пользователю на "ты".
+- Обращайся на "ты".
 - 6–10 коротких строк.
 - Не задавай вопросов и не используй '?'.
-- Не пиши "некорректно/ошибки/не примут/бесполезно".
-- Пиши нейтрально: "Добавь…", "Укажи…", "Зафиксируй…", "Пропиши…".
-
-Выводи только комментарий.
+- Пиши нейтрально: "Добавь…", "Укажи…", "Зафиксируй…", "Проверь…".
 """
 
 PROMPT_CLAIM = """
@@ -112,7 +110,7 @@ PROMPT_CLAIM = """
 - Без Markdown.
 - Официальный стиль.
 - Если данных нет — "___". Если есть — вставляй как есть.
-- Ничего не выдумывай: даты, суммы, реквизиты, нормы закона — только если пользователь дал явно.
+- Ничего не выдумывай.
 - Структура:
   Кому: ___
   От кого: ___
@@ -133,8 +131,7 @@ PROMPT_CLAIM_COMMENT = """
 - Обращайся к пользователю на "ты".
 - 7–11 коротких строк.
 - Не задавай вопросов и не используй '?'.
-- Не используй: "некорректно", "ошибки", "в надлежащий вид", "не примут", "бесполезно".
-- Пиши нейтрально: "Добавь…", "Укажи…", "Зафиксируй…", "Приложи…".
+- Не используй оценочные слова: "некорректно", "ошибки", "в надлежащий вид", "не примут", "бесполезно".
 - Последняя строка ВСЕГДА: "Приложи копии: ...".
 """
 
@@ -209,27 +206,6 @@ def file_url_for(filename: str, request: Request) -> str:
     return f"{base}/files/{filename}"
 
 
-def sanitize_comment(text: str) -> str:
-    if not text:
-        return ""
-    t = text.strip().replace("?", "")
-    banned = [
-        "составлена некорректно",
-        "некорректно",
-        "содержит ошибки",
-        "ошибки",
-        "привести её в надлежащий вид",
-        "в надлежащий вид",
-        "не примут",
-        "бесполезно",
-        "незаконно",
-        "недействительно",
-    ]
-    for p in banned:
-        t = re.sub(re.escape(p), "", t, flags=re.IGNORECASE).strip()
-    return re.sub(r"\n{3,}", "\n\n", t).strip()
-
-
 def extract_extra(payload: Dict[str, Any]) -> str:
     extra = (
         payload.get("Доп данные")
@@ -241,51 +217,28 @@ def extract_extra(payload: Dict[str, Any]) -> str:
     return str(extra).strip()
 
 
-def scenario_alias(s: str) -> str:
-    s = (s or "").strip().lower()
-    if s in ("contract", "draft_contract", "договора", "договора_черновик", "services_contract"):
-        return "contract"
-    if s in ("claim", "draft_claim", "претензия", "претензии", "claim_unpaid"):
-        return "claim"
-    if s in ("clause", "ask", "help", "пункты", "правки"):
-        return "clause"
-
-    # шаблоны
-    if s in ("templates_list", "my_templates", "templates"):
-        return "templates_list"
-    if s in ("template_save", "save_template"):
-        return "template_save"
-    if s in ("template_use", "use_template"):
-        return "template_use"
-    if s in ("template_delete", "delete_template"):
-        return "template_delete"
-
-    return "contract"
+def sanitize_comment(text: str) -> str:
+    if not text:
+        return ""
+    t = text.strip().replace("?", "")
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
 
 
-def get_template_slot(payload: Dict[str, Any]) -> Optional[int]:
-    """
-    ВАЖНО: поддерживаем ключ С ПРОБЕЛОМ: "template slot"
-    """
-    raw = (
-        payload.get("template slot")
-        or payload.get("template_slot")
-        or payload.get("templateSlot")
-        or payload.get("slot")
-    )
-    if raw is None:
+def parse_slot_any(v: Any) -> Optional[int]:
+    if v is None:
         return None
-    s = str(raw).strip()
+    s = str(v).strip()
     if not s:
         return None
-    digits = re.sub(r"\D+", "", s)
-    if not digits:
+    m = re.search(r"(\d+)", s)
+    if not m:
         return None
     try:
-        n = int(digits)
+        n = int(m.group(1))
     except Exception:
         return None
-    if 1 <= n <= USER_TEMPLATES_LIMIT:
+    if 1 <= n <= MAX_USER_TEMPLATES:
         return n
     return None
 
@@ -297,7 +250,6 @@ def db_init():
     con = sqlite3.connect(DB_PATH, timeout=30)
     cur = con.cursor()
     cur.execute("PRAGMA journal_mode=WAL;")
-
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -306,20 +258,20 @@ def db_init():
         )
         """
     )
-
+    # Шаблоны пользователя по слотам 1..3
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS user_templates (
             uid TEXT NOT NULL,
             slot INTEGER NOT NULL,
             name TEXT NOT NULL,
-            data_text TEXT NOT NULL,
+            data_json TEXT NOT NULL,
             created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
             PRIMARY KEY (uid, slot)
         )
         """
     )
-
     con.commit()
     con.close()
 
@@ -364,79 +316,73 @@ def consume_free(uid: str) -> bool:
     return True
 
 
-def templates_get_all(uid: str) -> List[Dict[str, Any]]:
+# --- Templates DB helpers ---
+def get_templates_for_user(uid: str) -> Dict[int, Dict[str, Any]]:
     con = sqlite3.connect(DB_PATH, timeout=30)
     cur = con.cursor()
-    cur.execute("SELECT slot, name, created_at FROM user_templates WHERE uid=? ORDER BY slot ASC", (uid,))
+    cur.execute("SELECT slot, name, data_json, created_at, updated_at FROM user_templates WHERE uid=? ORDER BY slot", (uid,))
     rows = cur.fetchall()
     con.close()
-    return [{"slot": int(r[0]), "name": r[1], "created_at": int(r[2])} for r in rows]
+    out: Dict[int, Dict[str, Any]] = {}
+    for slot, name, data_json, created_at, updated_at in rows:
+        out[int(slot)] = {
+            "slot": int(slot),
+            "name": name,
+            "data": json.loads(data_json),
+            "created_at": int(created_at),
+            "updated_at": int(updated_at),
+        }
+    return out
 
 
-def templates_get(uid: str, slot: int) -> Optional[Dict[str, Any]]:
-    con = sqlite3.connect(DB_PATH, timeout=30)
-    cur = con.cursor()
-    cur.execute("SELECT slot, name, data_text, created_at FROM user_templates WHERE uid=? AND slot=?", (uid, slot))
-    row = cur.fetchone()
-    con.close()
-    if not row:
-        return None
-    return {"slot": int(row[0]), "name": row[1], "data_text": row[2], "created_at": int(row[3])}
-
-
-def templates_first_free_slot(uid: str) -> Optional[int]:
-    used = {t["slot"] for t in templates_get_all(uid)}
-    for s in range(1, USER_TEMPLATES_LIMIT + 1):
-        if s not in used:
+def pick_first_free_slot(uid: str) -> Optional[int]:
+    existing = get_templates_for_user(uid)
+    for s in range(1, MAX_USER_TEMPLATES + 1):
+        if s not in existing:
             return s
     return None
 
 
-def templates_save(uid: str, name: str, data_text: str, preferred_slot: Optional[int]) -> Tuple[bool, str, Optional[int]]:
-    """
-    Если preferred_slot указан (1..3) — сохраняем туда (перезаписываем).
-    Если нет — кладём в первый свободный слот 1..3.
-    """
-    name = (name or "").strip()
-    if not name:
-        return False, "Укажи имя шаблона (например: «Шаблон для Иванова»).", None
-
-    data_text = (data_text or "").strip()
-    if not data_text:
-        return False, "Не удалось сохранить: пустые данные договора.", None
-
-    slot = preferred_slot
-    if slot is None:
-        slot = templates_first_free_slot(uid)
-        if slot is None:
-            return False, "Лимит шаблонов исчерпан (3 из 3). Удали один шаблон и попробуй снова.", None
-
+def upsert_template(uid: str, slot: int, name: str, data: Dict[str, Any]) -> None:
+    now = int(time.time())
     con = sqlite3.connect(DB_PATH, timeout=30)
     cur = con.cursor()
     cur.execute(
         """
-        INSERT INTO user_templates(uid, slot, name, data_text, created_at)
-        VALUES(?, ?, ?, ?, ?)
+        INSERT INTO user_templates(uid, slot, name, data_json, created_at, updated_at)
+        VALUES(?, ?, ?, ?, ?, ?)
         ON CONFLICT(uid, slot) DO UPDATE SET
             name=excluded.name,
-            data_text=excluded.data_text,
-            created_at=excluded.created_at
+            data_json=excluded.data_json,
+            updated_at=excluded.updated_at
         """,
-        (uid, int(slot), name, data_text, int(time.time()))
+        (uid, slot, name.strip(), json.dumps(data, ensure_ascii=False), now, now),
     )
     con.commit()
     con.close()
-    return True, f"Сохранил шаблон «{name}» в слот {slot}.", int(slot)
 
 
-def templates_delete(uid: str, slot: int) -> bool:
+def delete_template(uid: str, slot: int) -> bool:
     con = sqlite3.connect(DB_PATH, timeout=30)
     cur = con.cursor()
-    cur.execute("DELETE FROM user_templates WHERE uid=? AND slot=?", (uid, int(slot)))
-    n = cur.rowcount
+    cur.execute("DELETE FROM user_templates WHERE uid=? AND slot=?", (uid, slot))
+    changed = cur.rowcount > 0
     con.commit()
     con.close()
-    return n > 0
+    return changed
+
+
+def templates_list_text(uid: str) -> str:
+    t = get_templates_for_user(uid)
+    lines = ["Вот твои шаблоны:"]
+    for s in range(1, MAX_USER_TEMPLATES + 1):
+        if s in t:
+            lines.append(f"{s}) {t[s]['name']}")
+        else:
+            lines.append(f"{s}) — пусто")
+    lines.append("")
+    lines.append("Выбери номер шаблона, чтобы использовать его.")
+    return "\n".join(lines).strip()
 
 
 # =========================
@@ -509,7 +455,7 @@ def render_pdf(text: str, out_path: str, title: str):
 
 
 # =========================
-# TEMPLATES (файлы)
+# Templates files cache
 # =========================
 _templates_cache: Dict[str, str] = {}
 _templates_lock = asyncio.Lock()
@@ -525,7 +471,7 @@ async def _read_file(path: str) -> str:
     return await loop.run_in_executor(None, _sync)
 
 
-async def get_template(name: str) -> str:
+async def get_template_file(name: str) -> str:
     path = os.path.join(TEMPLATES_DIR, name)
     async with _templates_lock:
         if path in _templates_cache:
@@ -538,8 +484,8 @@ async def get_template(name: str) -> str:
 
 
 async def build_services_contract_template() -> str:
-    base = await get_template(SERVICES_CONTRACT_TEMPLATE)
-    tail = await get_template(COMMON_TAIL_TEMPLATE)
+    base = await get_template_file(SERVICES_CONTRACT_TEMPLATE)
+    tail = await get_template_file(COMMON_TAIL_TEMPLATE)
     if COMMON_TAIL_PLACEHOLDER not in base:
         raise RuntimeError(f"Placeholder {COMMON_TAIL_PLACEHOLDER} not found in {SERVICES_CONTRACT_TEMPLATE}")
     return base.replace(COMMON_TAIL_PLACEHOLDER, tail)
@@ -579,7 +525,7 @@ async def get_gigachat_access_token() -> str:
         }
         data = {"scope": GIGACHAT_SCOPE}
 
-        async with httpx.AsyncClient(timeout=45, verify=GIGACHAT_VERIFY_SSL) as client:
+        async with httpx.AsyncClient(timeout=60, verify=GIGACHAT_VERIFY_SSL) as client:
             r = await client.post(GIGACHAT_OAUTH_URL, headers=headers, data=data)
             r.raise_for_status()
             js = r.json()
@@ -616,7 +562,7 @@ async def call_gigachat(system_prompt: str, user_content: str, max_tokens: int =
         "stream": False,
     }
 
-    async with httpx.AsyncClient(timeout=75, verify=GIGACHAT_VERIFY_SSL) as client:
+    async with httpx.AsyncClient(timeout=90, verify=GIGACHAT_VERIFY_SSL) as client:
         r = await client.post(url, headers=headers, json=payload)
         if r.status_code in (401, 403):
             global _token_value, _token_exp
@@ -643,45 +589,52 @@ async def call_llm(system_prompt: str, user_input: str, max_tokens: int = 1400) 
 
 
 # =========================
-# DATA BUILDER (минимальные поля)
+# DATA BUILDER
 # =========================
-def build_services_data_min(payload: Dict[str, Any]) -> str:
+def build_services_data_min(payload: Dict[str, Any]) -> Dict[str, Any]:
+    def clean(x: Any) -> str:
+        s = str(x).strip() if x is not None else ""
+        return s
+
+    return {
+        "exec_type": clean(payload.get("exec_type")),
+        "exec_name": clean(payload.get("exec_name")),
+        "client_name": clean(payload.get("client_name")),
+        "service_desc": clean(payload.get("service_desc") or payload.get("Предмет")),
+        "deadline_value": clean(payload.get("deadline_value") or payload.get("Сроки")),
+        "price_value": clean(payload.get("price_value")),
+        "acceptance_value": clean(payload.get("acceptance_value")),
+        "extra": clean(extract_extra(payload)),
+    }
+
+
+def data_dict_to_text(d: Dict[str, Any]) -> str:
     def v(x: Any) -> str:
         s = str(x).strip()
         return s if s else "___"
 
-    exec_type = payload.get("exec_type") or ""
-    exec_name = payload.get("exec_name") or ""
-    client_name = payload.get("client_name") or ""
-    service_desc = payload.get("service_desc") or payload.get("Предмет") or ""
-    deadline_value = payload.get("deadline_value") or payload.get("Сроки") or payload.get("Сроки и оплата") or ""
-    price_value = payload.get("price_value") or payload.get("Сроки и оплата") or ""
-    acceptance_value = payload.get("acceptance_value") or ""
-    extra = extract_extra(payload)
-
-    data = (
+    return (
         f"Исполнитель:\n"
-        f"- статус: {v(exec_type)}\n"
-        f"- как указать: {v(exec_name)}\n\n"
+        f"- статус: {v(d.get('exec_type'))}\n"
+        f"- как указать: {v(d.get('exec_name'))}\n\n"
         f"Заказчик:\n"
-        f"- как указать: {v(client_name)}\n\n"
+        f"- как указать: {v(d.get('client_name'))}\n\n"
         f"Услуга:\n"
-        f"- описание: {v(service_desc)}\n\n"
+        f"- описание: {v(d.get('service_desc'))}\n\n"
         f"Сроки:\n"
-        f"- значение: {v(deadline_value)}\n\n"
+        f"- значение: {v(d.get('deadline_value'))}\n\n"
         f"Цена и оплата:\n"
-        f"- значение: {v(price_value)}\n\n"
+        f"- значение: {v(d.get('price_value'))}\n\n"
         f"Приёмка:\n"
-        f"- значение: {v(acceptance_value)}\n\n"
-        f"Доп данные:\n{v(extra)}\n"
-    )
-    return data.strip()
+        f"- значение: {v(d.get('acceptance_value'))}\n\n"
+        f"Доп данные:\n{v(d.get('extra'))}\n"
+    ).strip()
 
 
 # =========================
 # FASTAPI
 # =========================
-app = FastAPI(title="LegalFox API", version="4.0.0-templates-slots")
+app = FastAPI(title="LegalFox API", version="4.0.0-user-templates-3slots")
 
 os.makedirs(FILES_DIR, exist_ok=True)
 app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
@@ -697,164 +650,174 @@ async def root():
         "model": GIGACHAT_MODEL,
         "verify_ssl": bool(GIGACHAT_VERIFY_SSL),
         "free_pdf_limit": FREE_PDF_LIMIT,
-        "templates_limit": USER_TEMPLATES_LIMIT,
-        "templates_dir": TEMPLATES_DIR,
-        "services_template": SERVICES_CONTRACT_TEMPLATE,
-        "common_tail": COMMON_TAIL_TEMPLATE,
+        "max_user_templates": MAX_USER_TEMPLATES,
     }
 
 
 @app.post("/legalfox")
-async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-    scenario_raw = payload.get("scenario") or payload.get("Сценарий") or payload.get("сценарий") or "contract"
-    scenario = scenario_alias(str(scenario_raw))
+async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
+    scenario_raw = (payload.get("scenario") or payload.get("Сценарий") or payload.get("сценарий") or "contract")
+    scenario = str(scenario_raw).strip().lower()
 
-    # 3 функция: правки (может быть без uid)
+    # --------- UID ----------
+    uid, uid_src = pick_uid(payload)
+    if not uid and scenario != "clause":
+        return {"scenario": scenario, "reply_text": "Техническая ошибка: не удалось определить пользователя (bh_user_id/user_id).", "file_url": ""}
+
+    if uid:
+        ensure_user(uid)
+
+    # --------- CLAUSE ----------
     if scenario == "clause":
-        q = payload.get("Запрос") or payload.get("query") or payload.get("Вопрос") or payload.get("Текст") or ""
+        q = payload.get("query") or payload.get("Запрос") or payload.get("Вопрос") or payload.get("Текст") or ""
         q = str(q).strip()
         if not q:
             return {"scenario": "clause", "reply_text": "Напиши вопрос или вставь текст одним сообщением — помогу.", "file_url": ""}
         try:
-            answer = await call_llm(PROMPT_CLAUSE, q, max_tokens=800)
+            answer = await call_llm(PROMPT_CLAUSE, q, max_tokens=900)
             return {"scenario": "clause", "reply_text": answer, "file_url": ""}
         except Exception as e:
             logger.exception("legalfox error (clause): %s", e)
             return {"scenario": "clause", "reply_text": FALLBACK_TEXT, "file_url": ""}
 
-    # Для всего остального нужен uid
-    uid, uid_src = pick_uid(payload)
-    if not uid:
-        return {"scenario": scenario, "reply_text": "Техническая ошибка: не удалось определить пользователя (bh_user_id/user_id).", "file_url": ""}
+    # --------- templates_list ----------
+    if scenario == "templates_list":
+        txt = templates_list_text(uid)
+        return {"scenario": "templates_list", "reply_text": txt, "file_url": ""}
 
-    ensure_user(uid)
+    # --------- template_save ----------
+    if scenario == "template_save":
+        name = (payload.get("template name") or payload.get("template_name") or "").strip()
+        if not name:
+            return {"scenario": "template_save", "reply_text": "Укажи имя шаблона (коротко), и я сохраню его.", "file_url": ""}
 
-    premium = get_premium_flag(payload)
-    with_file_requested = get_with_file_requested(payload)
+        # ВАЖНО: ключ с пробелом
+        desired_slot = parse_slot_any(payload.get("template slot"))
 
-    trial_left = free_left(uid)
-    can_file = premium or (trial_left > 0)
-    with_file = with_file_requested and can_file
+        # данные сохраняем из текущих полей договора
+        data = build_services_data_min(payload)
 
-    logger.info(
-        "Scenario=%s uid=%s(uid_src=%s) premium=%s trial_left=%s with_file_requested=%s with_file=%s",
-        scenario, uid, uid_src, premium, trial_left, with_file_requested, with_file
-    )
+        existing = get_templates_for_user(uid)
 
-    try:
-        # =======================
-        # МОИ ШАБЛОНЫ: список
-        # =======================
-        if scenario == "templates_list":
-            items = templates_get_all(uid)
-            if not items:
-                txt = (
-                    "Вот твои шаблоны:\n"
-                    "Пока нечего сохранять. Сначала собери договор и нажми «Сохранить шаблон»."
-                )
-                return {"scenario": "templates_list", "reply_text": txt, "file_url": ""}
-
-            lines = ["Вот твои шаблоны:"]
-            for it in items:
-                lines.append(f"{it['slot']}) {it['name']}")
-            lines.append("\nВыбери номер (1–3), чтобы использовать шаблон.")
-            return {"scenario": "templates_list", "reply_text": "\n".join(lines), "file_url": ""}
-
-        # =======================
-        # МОИ ШАБЛОНЫ: сохранить
-        # =======================
-        if scenario == "template_save":
-            template_name = payload.get("template name") or payload.get("template_name") or payload.get("name") or ""
-            preferred_slot = get_template_slot(payload)  # читает "template slot" (с пробелом)
-            data_text = build_services_data_min(payload)
-
-            ok, msg, slot = templates_save(uid, str(template_name), data_text, preferred_slot)
-
-            # В ответ кладём поле С ПРОБЕЛОМ — чтобы ты мог при желании записать его в BotHelp
-            resp: Dict[str, Any] = {"scenario": "template_save", "reply_text": msg, "file_url": ""}
-            if slot is not None:
-                resp["template slot"] = str(slot)  # ключ С ПРОБЕЛОМ
-            return resp
-
-        # =======================
-        # МОИ ШАБЛОНЫ: удалить
-        # =======================
-        if scenario == "template_delete":
-            slot = get_template_slot(payload)
+        if desired_slot is not None:
+            # если передали конкретный слот — сохраняем туда, но не перетираем “тихо”
+            if desired_slot in existing:
+                return {"scenario": "template_save", "reply_text": f"Слот {desired_slot} уже занят. Удали его или выбери другой слот.", "file_url": ""}
+            slot = desired_slot
+        else:
+            slot = pick_first_free_slot(uid)
             if slot is None:
-                return {
-                    "scenario": "template_delete",
-                    "reply_text": "Укажи номер шаблона для удаления: 1, 2 или 3.",
-                    "file_url": ""
-                }
-            ok = templates_delete(uid, slot)
-            if ok:
-                return {"scenario": "template_delete", "reply_text": f"Удалил шаблон из слота {slot}.", "file_url": ""}
-            return {"scenario": "template_delete", "reply_text": f"В слоте {slot} нет сохранённого шаблона.", "file_url": ""}
+                return {"scenario": "template_save", "reply_text": "Лимит шаблонов исчерпан (3/3). Удали один шаблон, чтобы сохранить новый.", "file_url": ""}
 
-        # =======================
-        # МОИ ШАБЛОНЫ: использовать
-        # =======================
-        if scenario == "template_use":
-            slot = get_template_slot(payload)
-            if slot is None:
-                return {"scenario": "template_use", "reply_text": "Выбери номер шаблона: 1, 2 или 3.", "file_url": ""}
+        upsert_template(uid, slot, name, data)
+        txt = f"Сохранил шаблон в слот {slot}: {name}\n\n" + templates_list_text(uid)
+        return {"scenario": "template_save", "reply_text": txt, "file_url": ""}
 
-            tpl = templates_get(uid, slot)
-            if not tpl:
-                return {"scenario": "template_use", "reply_text": f"В слоте {slot} нет шаблона.", "file_url": ""}
+    # --------- template_delete ----------
+    if scenario == "template_delete":
+        slot = parse_slot_any(payload.get("template slot"))
+        if slot is None:
+            return {"scenario": "template_delete", "reply_text": "Напиши номер слота (1, 2 или 3), который нужно удалить.", "file_url": ""}
 
-            # Шаблон документа (файловый) + DATA из сохранённого шаблона
+        ok = delete_template(uid, slot)
+        if not ok:
+            return {"scenario": "template_delete", "reply_text": f"В слоте {slot} ничего нет.\n\n" + templates_list_text(uid), "file_url": ""}
+
+        return {"scenario": "template_delete", "reply_text": f"Удалил шаблон из слота {slot}.\n\n" + templates_list_text(uid), "file_url": ""}
+
+    # --------- template_use ----------
+    if scenario == "template_use":
+        slot = parse_slot_any(payload.get("template slot"))
+        if slot is None:
+            return {"scenario": "template_use", "reply_text": "Выбери номер шаблона: 1, 2 или 3.", "file_url": ""}
+
+        t = get_templates_for_user(uid)
+        if slot not in t:
+            return {"scenario": "template_use", "reply_text": f"В слоте {slot} нет шаблона.\n\n" + templates_list_text(uid), "file_url": ""}
+
+        tpl_name = t[slot]["name"]
+        stored_data = t[slot]["data"]
+        # Генерация как обычный contract (но data берём из шаблона)
+        premium = get_premium_flag(payload)
+        with_file_requested = get_with_file_requested(payload)
+
+        trial_left = free_left(uid)
+        can_file = premium or (trial_left > 0)
+        with_file = with_file_requested and can_file
+
+        logger.info(
+            "Scenario=template_use uid=%s(uid_src=%s) slot=%s premium=%s trial_left=%s with_file_requested=%s with_file=%s",
+            uid, uid_src, slot, premium, trial_left, with_file_requested, with_file
+        )
+
+        try:
             template_text = await build_services_contract_template()
-            llm_user_msg = f"TEMPLATE:\n{template_text}\n\nDATA:\n{tpl['data_text']}\n"
+            data_text = data_dict_to_text(stored_data)
+            llm_user_msg = f"TEMPLATE:\n{template_text}\n\nDATA:\n{data_text}\n"
 
-            draft = await call_llm(PROMPT_DRAFT_WITH_TEMPLATE, llm_user_msg, max_tokens=1700)
+            draft = await call_llm(PROMPT_DRAFT_WITH_TEMPLATE, llm_user_msg, max_tokens=1900)
 
             comment = ""
             try:
-                comment = await call_llm(PROMPT_CONTRACT_COMMENT, tpl["data_text"], max_tokens=260)
+                comment = await call_llm(PROMPT_CONTRACT_COMMENT, data_text, max_tokens=420)
                 comment = sanitize_comment(comment)
             except Exception as e:
                 logger.warning("Comment generation failed (template_use): %s", e)
                 comment = ""
 
-            if not with_file:
-                # если нет подписки и trial исчерпан — просто текст
-                txt = f"Ты использовал шаблон: {tpl['name']}\n\n{draft}"
+            if with_file:
+                fn = safe_filename("contract")
+                out_path = os.path.join(FILES_DIR, fn)
+                render_pdf(draft, out_path, title="ДОГОВОР ОКАЗАНИЯ УСЛУГ (ЧЕРНОВИК)")
+
+                # списываем trial только если реально отдаём PDF
+                if (not premium) and trial_left > 0:
+                    ok = consume_free(uid)
+                    logger.info("Trial consume uid=%s ok=%s", uid, ok)
+
+                txt = f"Ты использовал шаблон: {tpl_name}\n\nГотово. Я подготовил черновик договора и прикрепил PDF ниже."
                 if comment:
                     txt += f"\n\nКомментарий по твоему кейсу:\n{comment}"
-                if with_file_requested and (not premium) and trial_left <= 0:
-                    txt += "\n\nПробный PDF уже использован. Подписка даёт неограниченные PDF и повторную сборку."
-                return {"scenario": "template_use", "reply_text": txt, "file_url": ""}
 
-            fn = safe_filename("contract")
-            out_path = os.path.join(FILES_DIR, fn)
-            render_pdf(draft, out_path, title="ДОГОВОР ОКАЗАНИЯ УСЛУГ (ЧЕРНОВИК)")
-            file_url = file_url_for(fn, request)
+                return {"scenario": "template_use", "reply_text": txt, "file_url": file_url_for(fn, request)}
 
-            if (not premium) and trial_left > 0:
-                ok2 = consume_free(uid)
-                logger.info("Trial consume uid=%s ok=%s", uid, ok2)
-
-            txt = f"Готово. Ты использовал шаблон: {tpl['name']}\nЯ прикрепил PDF ниже."
+            # без файла
+            txt = f"Ты использовал шаблон: {tpl_name}\n\n" + draft
             if comment:
                 txt += f"\n\nКомментарий по твоему кейсу:\n{comment}"
+            if with_file_requested and (not premium) and trial_left <= 0:
+                txt += "\n\nПробный PDF уже использован. Подписка даёт неограниченные PDF и повторную сборку."
+            return {"scenario": "template_use", "reply_text": txt, "file_url": ""}
 
-            return {"scenario": "template_use", "reply_text": txt, "file_url": file_url}
+        except Exception as e:
+            logger.exception("legalfox error (template_use): %s", e)
+            return {"scenario": "template_use", "reply_text": FALLBACK_TEXT, "file_url": ""}
 
-        # =======================
-        # CONTRACT
-        # =======================
-        if scenario == "contract":
+    # --------- CONTRACT (обычная генерация) ----------
+    if scenario == "contract":
+        premium = get_premium_flag(payload)
+        with_file_requested = get_with_file_requested(payload)
+
+        trial_left = free_left(uid)
+        can_file = premium or (trial_left > 0)
+        with_file = with_file_requested and can_file
+
+        logger.info(
+            "Scenario=contract uid=%s(uid_src=%s) premium=%s trial_left=%s with_file_requested=%s with_file=%s",
+            uid, uid_src, premium, trial_left, with_file_requested, with_file
+        )
+
+        try:
             template_text = await build_services_contract_template()
-            data_text = build_services_data_min(payload)
+            data_dict = build_services_data_min(payload)
+            data_text = data_dict_to_text(data_dict)
             llm_user_msg = f"TEMPLATE:\n{template_text}\n\nDATA:\n{data_text}\n"
 
-            draft = await call_llm(PROMPT_DRAFT_WITH_TEMPLATE, llm_user_msg, max_tokens=1800)
+            draft = await call_llm(PROMPT_DRAFT_WITH_TEMPLATE, llm_user_msg, max_tokens=1900)
 
             comment = ""
             try:
-                comment = await call_llm(PROMPT_CONTRACT_COMMENT, data_text, max_tokens=260)
+                comment = await call_llm(PROMPT_CONTRACT_COMMENT, data_text, max_tokens=420)
                 comment = sanitize_comment(comment)
             except Exception as e:
                 logger.warning("Comment generation failed (contract): %s", e)
@@ -864,7 +827,6 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 fn = safe_filename("contract")
                 out_path = os.path.join(FILES_DIR, fn)
                 render_pdf(draft, out_path, title="ДОГОВОР ОКАЗАНИЯ УСЛУГ (ЧЕРНОВИК)")
-                file_url = file_url_for(fn, request)
 
                 if (not premium) and trial_left > 0:
                     ok = consume_free(uid)
@@ -873,7 +835,8 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 txt = "Готово. Я подготовил черновик договора и прикрепил PDF ниже."
                 if comment:
                     txt += f"\n\nКомментарий по твоему кейсу:\n{comment}"
-                return {"scenario": "contract", "reply_text": txt, "file_url": file_url}
+
+                return {"scenario": "contract", "reply_text": txt, "file_url": file_url_for(fn, request)}
 
             txt = draft
             if comment:
@@ -882,37 +845,47 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 txt += "\n\nПробный PDF уже использован. Подписка даёт неограниченные PDF и повторную сборку."
             return {"scenario": "contract", "reply_text": txt, "file_url": ""}
 
-        # =======================
-        # CLAIM
-        # =======================
-        if scenario == "claim":
-            def v(x: Any) -> str:
-                s = str(x).strip()
-                return s if s else "___"
+        except Exception as e:
+            logger.exception("legalfox error (contract): %s", e)
+            return {"scenario": "contract", "reply_text": FALLBACK_TEXT, "file_url": ""}
 
-            to_whom = payload.get("Адресат") or payload.get("to_whom") or ""
-            from_whom = payload.get("От кого") or payload.get("from_whom") or ""
-            circumstances = payload.get("Обстоятельства") or payload.get("viol") or payload.get("Нарушение и обстоятельства") or ""
-            reqs = payload.get("Требования") or payload.get("reqs") or ""
-            term = payload.get("Сроки исполнения") or payload.get("term") or ""
-            contacts = payload.get("Контакты") or payload.get("contacts") or ""
-            extra = extract_extra(payload)
+    # --------- CLAIM ----------
+    if scenario == "claim":
+        premium = get_premium_flag(payload)
+        with_file_requested = get_with_file_requested(payload)
 
-            user_text = (
-                f"Кому: {v(to_whom)}\n"
-                f"От кого: {v(from_whom)}\n"
-                f"Обстоятельства: {v(circumstances)}\n"
-                f"Требования: {v(reqs)}\n"
-                f"Срок исполнения: {v(term)}\n"
-                f"Контакты: {v(contacts)}\n"
-                f"Доп данные: {v(extra)}\n"
-            ).strip()
+        trial_left = free_left(uid)
+        can_file = premium or (trial_left > 0)
+        with_file = with_file_requested and can_file
 
-            draft = await call_llm(PROMPT_CLAIM, user_text, max_tokens=1400)
+        def v(x: Any) -> str:
+            s = str(x).strip()
+            return s if s else "___"
+
+        to_whom = payload.get("Адресат") or payload.get("to_whom") or ""
+        from_whom = payload.get("От кого") or payload.get("from_whom") or ""
+        circumstances = payload.get("Обстоятельства") or payload.get("viol") or payload.get("Нарушение и обстоятельства") or ""
+        reqs = payload.get("Требования") or payload.get("reqs") or ""
+        term = payload.get("Сроки исполнения") or payload.get("term") or ""
+        contacts = payload.get("Контакты") or payload.get("contacts") or ""
+        extra = extract_extra(payload)
+
+        user_text = (
+            f"Кому: {v(to_whom)}\n"
+            f"От кого: {v(from_whom)}\n"
+            f"Обстоятельства: {v(circumstances)}\n"
+            f"Требования: {v(reqs)}\n"
+            f"Срок исполнения: {v(term)}\n"
+            f"Контакты: {v(contacts)}\n"
+            f"Доп данные: {v(extra)}\n"
+        ).strip()
+
+        try:
+            draft = await call_llm(PROMPT_CLAIM, user_text, max_tokens=1600)
 
             comment = ""
             try:
-                comment = await call_llm(PROMPT_CLAIM_COMMENT, user_text, max_tokens=260)
+                comment = await call_llm(PROMPT_CLAIM_COMMENT, user_text, max_tokens=420)
                 comment = sanitize_comment(comment)
             except Exception as e:
                 logger.warning("Comment generation failed (claim): %s", e)
@@ -922,7 +895,6 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 fn = safe_filename("claim")
                 out_path = os.path.join(FILES_DIR, fn)
                 render_pdf(draft, out_path, title="ПРЕТЕНЗИЯ (ЧЕРНОВИК)")
-                file_url = file_url_for(fn, request)
 
                 if (not premium) and trial_left > 0:
                     ok = consume_free(uid)
@@ -931,7 +903,8 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 txt = "Готово. Я подготовил черновик претензии и прикрепил PDF ниже."
                 if comment:
                     txt += f"\n\nКомментарий по твоему кейсу:\n{comment}"
-                return {"scenario": "claim", "reply_text": txt, "file_url": file_url}
+
+                return {"scenario": "claim", "reply_text": txt, "file_url": file_url_for(fn, request)}
 
             txt = draft
             if comment:
@@ -940,8 +913,9 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 txt += "\n\nПробный PDF уже использован. Подписка даёт неограниченные PDF и повторную сборку."
             return {"scenario": "claim", "reply_text": txt, "file_url": ""}
 
-        return {"scenario": scenario, "reply_text": "Неизвестный сценарий.", "file_url": ""}
+        except Exception as e:
+            logger.exception("legalfox error (claim): %s", e)
+            return {"scenario": "claim", "reply_text": FALLBACK_TEXT, "file_url": ""}
 
-    except Exception as e:
-        logger.exception("legalfox error: %s", e)
-        return {"scenario": scenario, "reply_text": FALLBACK_TEXT, "file_url": ""}
+    # --------- default ----------
+    return {"scenario": scenario, "reply_text": "Неизвестный сценарий.", "file_url": ""}
