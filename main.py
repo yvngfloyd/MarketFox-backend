@@ -3,6 +3,7 @@ import re
 import uuid
 import time
 import json
+import shutil
 import sqlite3
 import logging
 import asyncio
@@ -19,7 +20,7 @@ from reportlab.pdfgen import canvas
 
 
 # =========================
-# ЛОГГЕР
+# LOGGER
 # =========================
 logger = logging.getLogger("legalfox")
 logger.setLevel(logging.INFO)
@@ -30,42 +31,45 @@ if not logger.handlers:
 
 
 # =========================
-# КОНФИГ
+# CONFIG
 # =========================
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 FILES_DIR = os.getenv("FILES_DIR", "files")
 DB_PATH = os.getenv("DB_PATH", "legalfox.db")
 
+# Trial: 1 free PDF per user (contract/claim). Template use does NOT consume trial.
 FREE_PDF_LIMIT = int(os.getenv("FREE_PDF_LIMIT", "1"))
 
+# LLM: GigaChat
 LLM_PROVIDER = (os.getenv("LLM_PROVIDER", "gigachat") or "gigachat").strip().lower()
 GIGACHAT_AUTH_KEY = os.getenv("GIGACHAT_AUTH_KEY")  # base64(ClientID:ClientSecret)
 GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
-GIGACHAT_MODEL = os.getenv("GIGACHAT_MODEL", "GigaChat-Lite")
+GIGACHAT_MODEL = os.getenv("GIGACHAT_MODEL", "GigaChat-2-Pro")
 
 GIGACHAT_OAUTH_URL = os.getenv("GIGACHAT_OAUTH_URL", "https://ngw.devices.sberbank.ru:9443/api/v2/oauth")
-GIGACHAT_BASE_URL = os.getenv("GIGACHAT_BASE_URL", "https://gigachat.devices.sberbank.ru")
-GIGACHAT_CHAT_PATH = os.getenv("GIGACHAT_CHAT_PATH", "/api/v1/chat/completions")
-GIGACHAT_VERIFY_SSL = (os.getenv("GIGACHAT_VERIFY_SSL", "1").strip() != "0")
 
-# ускоряем: меньше таймаут по умолчанию (можешь поднять, если надо)
-GIGACHAT_TIMEOUT_SEC = int(os.getenv("GIGACHAT_TIMEOUT_SEC", "90"))
+# IMPORTANT: base url should include /api  (fixes your 404 in logs)
+GIGACHAT_BASE_URL = os.getenv("GIGACHAT_BASE_URL", "https://gigachat.devices.sberbank.ru/api").rstrip("/")
+# IMPORTANT: path without /api prefix
+GIGACHAT_CHAT_PATH = os.getenv("GIGACHAT_CHAT_PATH", "/v1/chat/completions")
+
+# Railway: if SSL verify fails => set env GIGACHAT_VERIFY_SSL=0
+GIGACHAT_VERIFY_SSL = (os.getenv("GIGACHAT_VERIFY_SSL", "1").strip() != "0")
 
 FALLBACK_TEXT = "Сейчас не могу обратиться к нейросети. Попробуй повторить чуть позже."
 
+# Templates (files for contract draft)
 TEMPLATES_DIR = os.getenv("TEMPLATES_DIR", "templates")
 SERVICES_CONTRACT_TEMPLATE = os.getenv("SERVICES_CONTRACT_TEMPLATE", "contract_services_v1.txt")
 COMMON_TAIL_TEMPLATE = os.getenv("COMMON_TAIL_TEMPLATE", "common_contract_tail_8_12.txt")
 COMMON_TAIL_PLACEHOLDER = os.getenv("COMMON_TAIL_PLACEHOLDER", "{{COMMON_CONTRACT_TAIL}}")
 
+# Saved templates slots
 TEMPLATE_SLOTS_MAX = int(os.getenv("TEMPLATE_SLOTS_MAX", "3"))
-
-# опционально: отключить комментарии для ускорения (1/0)
-ENABLE_COMMENTS = (os.getenv("ENABLE_COMMENTS", "1").strip() == "1")
 
 
 # =========================
-# ПРОМТЫ
+# PROMPTS
 # =========================
 PROMPT_DRAFT_WITH_TEMPLATE = """
 Ты — LegalFox. Ты готовишь черновик договора оказания услуг по праву РФ для самозанятых/фрилансеров/микробизнеса.
@@ -77,8 +81,7 @@ PROMPT_DRAFT_WITH_TEMPLATE = """
 1) Без Markdown: никаких #, **, ``` и т.п.
 2) Ничего не выдумывай: паспорт, ИНН/ОГРН, адреса, реквизиты, суммы, даты, сроки — только если пользователь дал явно и однозначно.
 3) Если данных нет / они неполные / размытые / противоречивые / выглядят как “мусор” — НЕ вставляй их.
-   Вместо этого оставляй ПУСТОЕ МЕСТО длинными подчёркиваниями.
-   Используй такие заглушки:
+   Вместо этого оставляй ПУСТОЕ МЕСТО подчёркиваниями:
    - короткие поля: "____________"
    - длинные поля: "________________________________________"
    - суммы/даты: "________ руб.", "__.__.____"
@@ -150,7 +153,7 @@ PROMPT_CLAUSE = """
 
 
 # =========================
-# УТИЛИТЫ
+# UTIL
 # =========================
 def normalize_bool(v: Any) -> bool:
     if v is None:
@@ -193,6 +196,16 @@ def extract_extra(payload: Dict[str, Any]) -> str:
     return str(extra).strip()
 
 
+def looks_like_bothelp_placeholder(s: str) -> bool:
+    if not s:
+        return True
+    if "{%" in s and "%}" in s:
+        return True
+    if "{{" in s and "}}" in s:
+        return True
+    return False
+
+
 def scenario_alias(s: str) -> str:
     s = (s or "").strip().lower()
     if s in ("contract", "draft_contract", "договора", "договора_черновик"):
@@ -213,7 +226,15 @@ def scenario_alias(s: str) -> str:
 
 
 def pick_uid(payload: Dict[str, Any]) -> Tuple[str, str]:
-    priority = ["bh_user_id", "user_id", "tg_user_id", "telegram_user_id", "messenger_user_id", "bothelp_user_id", "cuid"]
+    priority = [
+        "bh_user_id",
+        "user_id",
+        "tg_user_id",
+        "telegram_user_id",
+        "messenger_user_id",
+        "bothelp_user_id",
+        "cuid",
+    ]
     for key in priority:
         v = payload.get(key)
         if v is None:
@@ -255,7 +276,6 @@ def get_template_slot(payload: Dict[str, Any]) -> Optional[int]:
 
 
 def get_template_name(payload: Dict[str, Any]) -> str:
-    # поддержка всех вариантов, в т.ч. твоего "template_name"
     for k in ["template_name", "template - name", "template-name", "template name", "templateName"]:
         if k in payload:
             v = str(payload.get(k) or "").strip()
@@ -274,22 +294,29 @@ def sanitize_template_name(name: str) -> str:
     return name
 
 
-def make_error_response(scenario: str) -> Dict[str, str]:
-    return {"scenario": scenario, "reply_text": FALLBACK_TEXT, "file_url": ""}
-
-
-def looks_like_bothelp_placeholder(s: str) -> bool:
-    if not s:
-        return True
-    if "{%" in s and "%}" in s:
-        return True
-    if "{{" in s and "}}" in s:
-        return True
-    return False
+def sanitize_comment(text: str) -> str:
+    if not text:
+        return ""
+    t = text.strip().replace("?", "")
+    banned = [
+        "составлена некорректно",
+        "некорректно",
+        "содержит ошибки",
+        "ошибки",
+        "привести её в надлежащий вид",
+        "в надлежащий вид",
+        "не примут",
+        "бесполезно",
+        "незаконно",
+        "недействительно",
+    ]
+    for p in banned:
+        t = re.sub(re.escape(p), "", t, flags=re.IGNORECASE).strip()
+    return t
 
 
 # =========================
-# БД
+# DB
 # =========================
 def db_connect() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH, timeout=30)
@@ -315,15 +342,14 @@ def db_init():
         """
     )
 
+    # Saved templates store exact pdf copy
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS templates (
             uid TEXT NOT NULL,
             slot INTEGER NOT NULL,
             template_name TEXT NOT NULL,
-            draft_text TEXT,
-            pdf_filename TEXT,
-            payload TEXT,
+            pdf_filename TEXT NOT NULL,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
             PRIMARY KEY(uid, slot)
@@ -369,7 +395,7 @@ def consume_free(uid: str) -> bool:
     return True
 
 
-def set_last_contract(uid: str, draft_text: str, pdf_filename: Optional[str], payload_obj: Dict[str, Any]):
+def set_last_contract(uid: str, draft_text: str, pdf_filename: str, payload_obj: Dict[str, Any]):
     ensure_user(uid)
     con = db_connect()
     cur = con.cursor()
@@ -426,11 +452,11 @@ def list_templates(uid: str) -> List[sqlite3.Row]:
     return rows or []
 
 
-def get_template(uid: str, slot: int) -> Optional[sqlite3.Row]:
+def get_template_row(uid: str, slot: int) -> Optional[sqlite3.Row]:
     con = db_connect()
     cur = con.cursor()
     cur.execute(
-        "SELECT uid, slot, template_name, draft_text, pdf_filename, payload FROM templates WHERE uid=? AND slot=?",
+        "SELECT uid, slot, template_name, pdf_filename FROM templates WHERE uid=? AND slot=?",
         (uid, slot),
     )
     row = cur.fetchone()
@@ -447,54 +473,37 @@ def find_next_free_slot(uid: str) -> Optional[int]:
     return None
 
 
-def upsert_template(uid: str, slot: int, template_name: str, draft_text: str, pdf_filename: str, payload_text: str):
+def upsert_template(uid: str, slot: int, template_name: str, pdf_filename: str):
     now = int(time.time())
     con = db_connect()
     cur = con.cursor()
     cur.execute(
         """
-        INSERT INTO templates(uid, slot, template_name, draft_text, pdf_filename, payload, created_at, updated_at)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO templates(uid, slot, template_name, pdf_filename, created_at, updated_at)
+        VALUES(?, ?, ?, ?, ?, ?)
         ON CONFLICT(uid, slot) DO UPDATE SET
             template_name=excluded.template_name,
-            draft_text=excluded.draft_text,
             pdf_filename=excluded.pdf_filename,
-            payload=excluded.payload,
             updated_at=excluded.updated_at
         """,
-        (uid, slot, template_name, draft_text or "", pdf_filename or "", payload_text or "", now, now),
+        (uid, slot, template_name, pdf_filename, now, now),
     )
     con.commit()
     con.close()
 
 
 def delete_template(uid: str, slot: int) -> bool:
-    # удалим запись и (по возможности) файл
-    row = get_template(uid, slot)
-    pdf_fn = ""
-    if row:
-        pdf_fn = (row["pdf_filename"] or "").strip()
-
     con = db_connect()
     cur = con.cursor()
     cur.execute("DELETE FROM templates WHERE uid=? AND slot=?", (uid, slot))
     changed = cur.rowcount > 0
     con.commit()
     con.close()
-
-    if changed and pdf_fn:
-        try:
-            p = os.path.join(FILES_DIR, pdf_fn)
-            if os.path.exists(p):
-                os.remove(p)
-        except Exception:
-            logger.exception("Failed to remove template pdf file")
-
     return changed
 
 
 # =========================
-# PDF
+# PDF (render)
 # =========================
 def ensure_font_name() -> str:
     candidates = [
@@ -507,7 +516,7 @@ def ensure_font_name() -> str:
                 pdfmetrics.registerFont(TTFont(font_name, font_path))
                 return font_name
         except Exception:
-            logger.exception("Не удалось зарегистрировать шрифт: %s", font_path)
+            logger.exception("Font register failed: %s", font_path)
     return "Helvetica"
 
 
@@ -516,6 +525,7 @@ def render_pdf(text: str, out_path: str, title: str):
     c = canvas.Canvas(out_path, pagesize=A4)
     width, height = A4
 
+    # "GOST-like" margins
     left, right, top, bottom = 85, 42, 57, 57
     max_width = width - left - right
 
@@ -562,7 +572,7 @@ def render_pdf(text: str, out_path: str, title: str):
     c.save()
 
 
-def copy_pdf(src_filename: str) -> Optional[str]:
+def copy_existing_pdf(src_filename: str) -> Optional[str]:
     if not src_filename:
         return None
     src_path = os.path.join(FILES_DIR, src_filename)
@@ -571,13 +581,10 @@ def copy_pdf(src_filename: str) -> Optional[str]:
     new_fn = safe_filename("contract_tpl")
     dst_path = os.path.join(FILES_DIR, new_fn)
     try:
-        with open(src_path, "rb") as fsrc:
-            data = fsrc.read()
-        with open(dst_path, "wb") as fdst:
-            fdst.write(data)
+        shutil.copyfile(src_path, dst_path)
         return new_fn
     except Exception:
-        logger.exception("Failed to copy PDF")
+        logger.exception("PDF copy failed")
         return None
 
 
@@ -588,7 +595,7 @@ _templates_cache: Dict[str, str] = {}
 _templates_lock = asyncio.Lock()
 
 
-async def _read_file(path: str) -> str:
+async def _read_text_file(path: str) -> str:
     loop = asyncio.get_running_loop()
 
     def _sync():
@@ -605,7 +612,7 @@ async def get_template_file(name: str) -> str:
             return _templates_cache[path]
         if not os.path.exists(path):
             raise FileNotFoundError(f"Template not found: {path}")
-        txt = await _read_file(path)
+        txt = await _read_text_file(path)
         _templates_cache[path] = txt
         return txt
 
@@ -659,7 +666,7 @@ async def get_gigachat_access_token() -> str:
 
         token = js.get("access_token")
         if not token:
-            raise RuntimeError(f"OAuth ответ без access_token: {js}")
+            raise RuntimeError(f"OAuth response without access_token: {js}")
 
         _token_value = token
         _token_exp = _now() + 25 * 60
@@ -672,10 +679,7 @@ async def call_gigachat(system_prompt: str, user_content: str, max_tokens: int =
         raise RuntimeError("LLM_PROVIDER must be gigachat")
 
     token = await get_gigachat_access_token()
-
-    base = GIGACHAT_BASE_URL.rstrip("/")
-    path = GIGACHAT_CHAT_PATH if GIGACHAT_CHAT_PATH.startswith("/") else ("/" + GIGACHAT_CHAT_PATH)
-    url = f"{base}{path}"
+    url = f"{GIGACHAT_BASE_URL}{GIGACHAT_CHAT_PATH}"
 
     headers = {
         "Authorization": f"Bearer {token}",
@@ -689,16 +693,16 @@ async def call_gigachat(system_prompt: str, user_content: str, max_tokens: int =
             {"role": "system", "content": system_prompt.strip()},
             {"role": "user", "content": user_content.strip()},
         ],
+        # temperature 0 => меньше “фантазии”
         "temperature": 0.0,
         "top_p": 1,
         "max_tokens": int(max_tokens),
         "stream": False,
     }
 
-    async with httpx.AsyncClient(timeout=GIGACHAT_TIMEOUT_SEC, verify=GIGACHAT_VERIFY_SSL) as client:
+    async with httpx.AsyncClient(timeout=120, verify=GIGACHAT_VERIFY_SSL) as client:
         r = await client.post(url, headers=headers, json=payload)
 
-        # token refresh
         if r.status_code in (401, 403):
             global _token_value, _token_exp
             _token_value, _token_exp = None, 0.0
@@ -718,7 +722,7 @@ async def call_gigachat(system_prompt: str, user_content: str, max_tokens: int =
 
 
 # =========================
-# DATA BUILDER (поддержка ключей с пробелами)
+# DATA BUILDER (minimal fields)
 # =========================
 def _get(payload: Dict[str, Any], *keys: str) -> Any:
     for k in keys:
@@ -771,7 +775,7 @@ def build_services_data_min(payload: Dict[str, Any]) -> str:
 # =========================
 # FASTAPI
 # =========================
-app = FastAPI(title="LegalFox API", version="4.4.0-template-pdf-exact-copy")
+app = FastAPI(title="LegalFox API", version="5.0.0-template-pdf-exact-copy")
 
 os.makedirs(FILES_DIR, exist_ok=True)
 app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
@@ -785,11 +789,11 @@ async def root():
         "status": "ok",
         "service": "LegalFox",
         "model": GIGACHAT_MODEL,
+        "base_url": GIGACHAT_BASE_URL,
         "chat_path": GIGACHAT_CHAT_PATH,
         "verify_ssl": bool(GIGACHAT_VERIFY_SSL),
         "free_pdf_limit": FREE_PDF_LIMIT,
         "template_slots_max": TEMPLATE_SLOTS_MAX,
-        "comments": ENABLE_COMMENTS,
     }
 
 
@@ -798,7 +802,7 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
     scenario_raw = payload.get("scenario") or payload.get("Сценарий") or payload.get("сценарий") or "contract"
     scenario = scenario_alias(str(scenario_raw))
 
-    # CLAUSE
+    # ============= CLAUSE (3rd function) ============
     if scenario == "clause":
         q = payload.get("Запрос") or payload.get("query") or payload.get("Вопрос") or payload.get("Текст") or ""
         q = str(q).strip()
@@ -809,13 +813,15 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
             return {"scenario": "clause", "reply_text": answer, "file_url": ""}
         except Exception as e:
             logger.exception("legalfox error (clause): %s", e)
-            return make_error_response("clause")
+            return {"scenario": "clause", "reply_text": FALLBACK_TEXT, "file_url": ""}
 
+    # All other scenarios require uid
     uid, uid_src = pick_uid(payload)
     if not uid:
         return {"scenario": scenario, "reply_text": "Техническая ошибка: не удалось определить пользователя (bh_user_id/user_id).", "file_url": ""}
 
     ensure_user(uid)
+
     premium = get_premium_flag(payload)
     with_file_requested = get_with_file_requested(payload)
 
@@ -829,179 +835,155 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
     )
 
     try:
-        # =====================
-        # TEMPLATES (точная копия PDF)
-        # =====================
-        if scenario in ("template_list", "template_save", "template_use", "template_delete"):
-            # Если хочешь сделать шаблоны премиум-фичей — раскомментируй это:
-            # if not premium:
-            #     return {"scenario": scenario, "reply_text": "Шаблоны доступны по подписке. Оформи подписку, чтобы сохранять и повторять договоры.", "file_url": ""}
-
-            if scenario == "template_list":
-                rows = list_templates(uid)
-                if not rows:
-                    return {
-                        "scenario": "template_list",
-                        "reply_text": "Пока нет сохранённых шаблонов. Сначала сгенерируй договор с PDF, затем нажми «Сохранить шаблон».",
-                        "file_url": ""
-                    }
-
-                used = {int(r["slot"]) for r in rows}
-                free_slots = [str(s) for s in range(1, TEMPLATE_SLOTS_MAX + 1) if s not in used]
-
-                lines = ["Твои шаблоны:"]
-                for r in rows:
-                    lines.append(f"{int(r['slot'])}) {r['template_name']}")
-                if free_slots:
-                    lines.append("")
-                    lines.append(f"Свободные слоты: {', '.join(free_slots)}")
-                lines.append("")
-                lines.append("Нажми 1–3, чтобы использовать шаблон. Для удаления — «Удалить шаблон».")
-                return {"scenario": "template_list", "reply_text": "\n".join(lines), "file_url": ""}
-
-            if scenario == "template_save":
-                name = sanitize_template_name(get_template_name(payload)) or "Мой шаблон"
-
-                slot = get_template_slot(payload)
-                if slot is None:
-                    slot = find_next_free_slot(uid)
-                    if slot is None:
-                        return {
-                            "scenario": "template_save",
-                            "reply_text": "Лимит шаблонов достигнут (3 из 3). Удали один шаблон в разделе «Мои шаблоны», чтобы сохранить новый.",
-                            "file_url": ""
-                        }
-
-                # ВАЖНО: сохраняем только точную копию PDF последнего договора
-                last = get_last_contract(uid)
-                last_pdf = (last.get("pdf_filename") or "").strip()
-
-                if not last_pdf:
-                    return {
-                        "scenario": "template_save",
-                        "reply_text": "Чтобы сохранить шаблон, сначала сгенерируй договор с PDF-файлом, а затем нажми «Сохранить шаблон».",
-                        "file_url": ""
-                    }
-
-                copied = copy_pdf(last_pdf)
-                if not copied:
-                    return {
-                        "scenario": "template_save",
-                        "reply_text": "Не смог сохранить PDF (файл не найден). Сгенерируй договор с PDF ещё раз и повтори сохранение.",
-                        "file_url": ""
-                    }
-
-                # при перезаписи слота — удалим старый pdf, чтобы не копить мусор
-                old = get_template(uid, int(slot))
-                if old:
-                    old_pdf = (old["pdf_filename"] or "").strip()
-                    if old_pdf and old_pdf != copied:
-                        try:
-                            p = os.path.join(FILES_DIR, old_pdf)
-                            if os.path.exists(p):
-                                os.remove(p)
-                        except Exception:
-                            logger.exception("Failed to remove old template pdf on overwrite")
-
-                upsert_template(
-                    uid=uid,
-                    slot=int(slot),
-                    template_name=name,
-                    draft_text="",  # текст не нужен, источник истины = PDF
-                    pdf_filename=copied,
-                    payload_text="",  # можно не хранить
-                )
-
+        # ============= TEMPLATE LIST ============
+        if scenario == "template_list":
+            rows = list_templates(uid)
+            if not rows:
                 return {
-                    "scenario": "template_save",
-                    "reply_text": f"Сохранил шаблон «{name}» (слот {slot}). Открой «Мои шаблоны», чтобы использовать или удалить.",
+                    "scenario": "template_list",
+                    "reply_text": "Пока нет сохранённых шаблонов. Сначала собери договор и нажми «Сохранить шаблон».",
                     "file_url": ""
                 }
 
-            if scenario == "template_delete":
-                slot = get_template_slot(payload)
+            lines = ["Твои шаблоны:"]
+            for r in rows:
+                lines.append(f"{int(r['slot'])}) {r['template_name']}")
+            lines.append("")
+            lines.append("Нажми 1–3, чтобы использовать шаблон. Для удаления — кнопка «Удалить шаблон».")
+            return {"scenario": "template_list", "reply_text": "\n".join(lines), "file_url": ""}
+
+        # ============= TEMPLATE SAVE (EXACT PDF COPY) ============
+        if scenario == "template_save":
+            name = sanitize_template_name(get_template_name(payload)) or "Мой шаблон"
+
+            # Slot: if user didn't pass - auto next free
+            slot = get_template_slot(payload)
+            if slot is None:
+                slot = find_next_free_slot(uid)
                 if slot is None:
-                    return {"scenario": "template_delete", "reply_text": "Напиши номер слота (1–3), который нужно удалить.", "file_url": ""}
+                    return {
+                        "scenario": "template_save",
+                        "reply_text": "Лимит шаблонов достигнут (3 из 3). Удали один шаблон в разделе «Мои шаблоны», чтобы сохранить новый.",
+                        "file_url": ""
+                    }
 
-                ok = delete_template(uid, int(slot))
-                if ok:
-                    return {"scenario": "template_delete", "reply_text": f"Удалил шаблон из слота {slot}.", "file_url": ""}
-                return {"scenario": "template_delete", "reply_text": f"В слоте {slot} нет шаблона. Открой «Мои шаблоны» и проверь список.", "file_url": ""}
+            # We save EXACT last generated contract PDF
+            last = get_last_contract(uid)
+            last_pdf = (last.get("pdf_filename") or "").strip()
 
-            if scenario == "template_use":
-                slot = get_template_slot(payload)
-                if slot is None:
-                    return {"scenario": "template_use", "reply_text": "Напиши номер слота (1–3), чтобы использовать шаблон.", "file_url": ""}
-
-                row = get_template(uid, int(slot))
-                if not row:
-                    return {"scenario": "template_use", "reply_text": f"В слоте {slot} нет шаблона. Открой «Мои шаблоны» и проверь список.", "file_url": ""}
-
-                tname = row["template_name"]
-                pdf_fn = (row["pdf_filename"] or "").strip()
-                if not pdf_fn:
-                    return {"scenario": "template_use", "reply_text": f"Шаблон «{tname}» сохранён без PDF. Удали и сохрани заново.", "file_url": ""}
-
-                path = os.path.join(FILES_DIR, pdf_fn)
-                if not os.path.exists(path):
-                    return {"scenario": "template_use", "reply_text": f"Файл шаблона «{tname}» не найден. Удали шаблон и сохрани заново.", "file_url": ""}
-
+            if not last_pdf:
                 return {
-                    "scenario": "template_use",
-                    "reply_text": f"Ок. Использую шаблон «{tname}» (слот {slot}). Я прикрепил PDF ниже.",
-                    "file_url": file_url_for(pdf_fn, request),
+                    "scenario": "template_save",
+                    "reply_text": "Сначала сгенерируй договор с PDF (чтобы появился файл), затем нажми «Сохранить шаблон».",
+                    "file_url": ""
                 }
 
-        # =====================
-        # CONTRACT
-        # =====================
+            copied = copy_existing_pdf(last_pdf)
+            if not copied:
+                return {
+                    "scenario": "template_save",
+                    "reply_text": "Не смог сохранить копию PDF. Попробуй ещё раз: сначала сгенерируй договор, затем «Сохранить шаблон».",
+                    "file_url": ""
+                }
+
+            upsert_template(uid=uid, slot=int(slot), template_name=name, pdf_filename=copied)
+
+            return {
+                "scenario": "template_save",
+                "reply_text": f"Сохранил шаблон «{name}» (слот {slot}). Открой «Мои шаблоны», чтобы использовать или удалить.",
+                "file_url": ""
+            }
+
+        # ============= TEMPLATE DELETE ============
+        if scenario == "template_delete":
+            slot = get_template_slot(payload)
+            if slot is None:
+                return {"scenario": "template_delete", "reply_text": "Напиши номер слота (1–3), который нужно удалить.", "file_url": ""}
+
+            ok = delete_template(uid, int(slot))
+            if ok:
+                return {"scenario": "template_delete", "reply_text": f"Удалил шаблон из слота {slot}.", "file_url": ""}
+            return {"scenario": "template_delete", "reply_text": f"В слоте {slot} нет шаблона. Открой «Мои шаблоны» и проверь список.", "file_url": ""}
+
+        # ============= TEMPLATE USE (EXACT STORED PDF) ============
+        if scenario == "template_use":
+            slot = get_template_slot(payload)
+            if slot is None:
+                return {"scenario": "template_use", "reply_text": "Напиши номер слота (1–3), чтобы использовать шаблон.", "file_url": ""}
+
+            row = get_template_row(uid, int(slot))
+            if not row:
+                return {"scenario": "template_use", "reply_text": f"В слоте {slot} нет шаблона. Открой «Мои шаблоны» и проверь список.", "file_url": ""}
+
+            # Paywall logic for templates:
+            # - template file выдаём только если premium=True (рекомендуемый вариант)
+            # Если хочешь разрешить доступ по trial — замени на (premium or trial_left > 0)
+            if not premium:
+                return {
+                    "scenario": "template_use",
+                    "reply_text": "Шаблоны доступны по подписке: так ты можешь быстро пересобирать договоры без ручного ввода.",
+                    "file_url": ""
+                }
+
+            tname = row["template_name"]
+            pdf_fn = (row["pdf_filename"] or "").strip()
+            path = os.path.join(FILES_DIR, pdf_fn)
+
+            if not pdf_fn or not os.path.exists(path):
+                return {"scenario": "template_use", "reply_text": f"Шаблон «{tname}» не найден на сервере. Удали и сохрани заново.", "file_url": ""}
+
+            return {
+                "scenario": "template_use",
+                "reply_text": f"Ок. Использую шаблон «{tname}» (слот {slot}). Я прикрепил PDF ниже.",
+                "file_url": file_url_for(pdf_fn, request),
+            }
+
+        # ============= CONTRACT ============
         if scenario == "contract":
             template_text = await build_services_contract_template()
             data_text = build_services_data_min(payload)
             llm_user_msg = f"TEMPLATE:\n{template_text}\n\nDATA:\n{data_text}\n"
 
-            draft = await call_gigachat(PROMPT_DRAFT_WITH_TEMPLATE, llm_user_msg, max_tokens=1800)
+            draft = await call_gigachat(PROMPT_DRAFT_WITH_TEMPLATE, llm_user_msg, max_tokens=1900)
 
             comment = ""
-            if ENABLE_COMMENTS:
-                try:
-                    comment = await call_gigachat(PROMPT_CONTRACT_COMMENT, data_text, max_tokens=360)
-                    comment = comment.replace("?", "").strip()
-                except Exception as e:
-                    logger.warning("Comment generation failed (contract): %s", e)
-                    comment = ""
+            try:
+                comment = await call_gigachat(PROMPT_CONTRACT_COMMENT, data_text, max_tokens=420)
+                comment = sanitize_comment(comment)
+            except Exception as e:
+                logger.warning("Comment generation failed (contract): %s", e)
+                comment = ""
 
             if with_file:
                 pdf_filename = safe_filename("contract")
                 render_pdf(draft, os.path.join(FILES_DIR, pdf_filename), title="ДОГОВОР ОКАЗАНИЯ УСЛУГ (ЧЕРНОВИК)")
 
-                # trial списываем только если реально выдали PDF
+                # Consume trial ONLY on real PDF generation
                 if (not premium) and trial_left > 0:
                     ok = consume_free(uid)
                     logger.info("Trial consume uid=%s ok=%s", uid, ok)
+
+                # Save last_contract AFTER success
+                set_last_contract(uid, draft, pdf_filename, payload)
 
                 reply = "Готово. Я подготовил черновик договора и прикрепил PDF ниже."
                 if comment:
                     reply += f"\n\nКомментарий по твоему кейсу:\n{comment}"
 
-                # ВАЖНО: last_contract сохраняем ПОСЛЕ успешного PDF
-                set_last_contract(uid, draft, pdf_filename, payload)
-
                 return {"scenario": "contract", "reply_text": reply, "file_url": file_url_for(pdf_filename, request)}
 
-            # без файла
+            # no file
             reply = draft
             if comment:
                 reply += f"\n\nКомментарий по твоему кейсу:\n{comment}"
             if with_file_requested and (not premium) and trial_left <= 0:
                 reply += "\n\nПробный PDF уже использован. Подписка даёт неограниченные PDF и повторную сборку."
 
+            # Save last_contract draft even without pdf (optional)
             set_last_contract(uid, draft, "", payload)
             return {"scenario": "contract", "reply_text": reply, "file_url": ""}
 
-        # =====================
-        # CLAIM
-        # =====================
+        # ============= CLAIM ============
         if scenario == "claim":
             def v(x: Any) -> str:
                 s = str(x).strip()
@@ -1027,21 +1009,19 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
                 f"Доп данные: {v(extra)}\n"
             ).strip()
 
-            draft = await call_gigachat(PROMPT_CLAIM, user_text, max_tokens=1400)
+            draft = await call_gigachat(PROMPT_CLAIM, user_text, max_tokens=1600)
 
             comment = ""
-            if ENABLE_COMMENTS:
-                try:
-                    comment = await call_gigachat(PROMPT_CLAIM_COMMENT, user_text, max_tokens=360)
-                    comment = comment.replace("?", "").strip()
-                except Exception as e:
-                    logger.warning("Comment generation failed (claim): %s", e)
-                    comment = ""
+            try:
+                comment = await call_gigachat(PROMPT_CLAIM_COMMENT, user_text, max_tokens=420)
+                comment = sanitize_comment(comment)
+            except Exception as e:
+                logger.warning("Comment generation failed (claim): %s", e)
+                comment = ""
 
             if with_file:
                 fn = safe_filename("claim")
                 render_pdf(draft, os.path.join(FILES_DIR, fn), title="ПРЕТЕНЗИЯ (ЧЕРНОВИК)")
-
                 if (not premium) and trial_left > 0:
                     ok = consume_free(uid)
                     logger.info("Trial consume uid=%s ok=%s", uid, ok)
@@ -1062,4 +1042,5 @@ async def legalfox(request: Request, payload: Dict[str, Any] = Body(...)) -> Dic
 
     except Exception as e:
         logger.exception("legalfox error: %s", e)
-        return make_error_response(scenario)
+        # CRITICAL: never return stale file_url on errors
+        return {"scenario": scenario, "reply_text": FALLBACK_TEXT, "file_url": ""}
