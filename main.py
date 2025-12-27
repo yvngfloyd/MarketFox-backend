@@ -5,13 +5,13 @@ from config import WEBHOOK_URL
 app = FastAPI()
 
 @app.on_event("startup")
-async def on_startup():
+async def startup():
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(WEBHOOK_URL)
 
+
 @app.post("/webhook")
-async def telegram_webhook(req: Request):
+async def webhook(req: Request):
     data = await req.json()
-    print("WEBHOOK HIT:", data.get("update_id"))
     await dp.feed_raw_update(bot, data)
     return {"ok": True}
