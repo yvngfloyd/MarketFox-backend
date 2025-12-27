@@ -18,6 +18,15 @@ def materials_menu():
     ])
 
 
+def price_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Стяжка пола", callback_data="price_screed")],
+        [InlineKeyboardButton(text="Штукатурка стен", callback_data="price_plaster")],
+        [InlineKeyboardButton(text="Укладка плитки", callback_data="price_tile")],
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_menu")]
+    ])
+
+
 def back_to_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_menu")]
