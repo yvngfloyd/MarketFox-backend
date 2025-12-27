@@ -1,35 +1,3 @@
-from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery
-from keyboards import main_menu, materials_menu, price_menu
-from calculations import calc_concrete, calc_price
-
-router = Router()
-
-user_state = {}
-
-
-@router.message(F.text == "/start")
-async def start(msg: Message):
-    await msg.answer(
-        "LegalFox | Строительный помощник\n\n"
-        "Рассчитаю материалы или прикину стоимость работ.",
-        reply_markup=main_menu()
-    )
-
-
-@router.callback_query(F.data == "materials")
-async def materials(cb: CallbackQuery):
-    await cb.message.answer("Выберите тип работ:", reply_markup=materials_menu())
-    await cb.answer()
-
-
-@router.callback_query(F.data == "mat_concrete")
-async def concrete_start(cb: CallbackQuery):
-    user_state[cb.from_user.id] = {"step": "length"}
-    await cb.message.answer("Введите длину (м):")
-    await cb.answer()
-
-
 @router.message()
 async def input_handler(msg: Message):
     uid = msg.from_user.id
@@ -44,61 +12,63 @@ async def input_handler(msg: Message):
         await msg.answer("Введите число.")
         return
 
-    if state["step"] == "length":
-        state["length"] = value
-        state["step"] = "width"
-        await msg.answer("Введите ширину (м):")
+    material = state.get("type")
 
-    elif state["step"] == "width":
-        state["width"] = value
-        state["step"] = "height"
-        await msg.answer("Введите высоту / толщину (м):")
+    # ===== СТЯЖКА =====
+    if material == "screed":
+        if state["step"] == "area":
+            state["area"] = value
+            state["step"] = "thickness"
+            await msg.answer("Введите толщину стяжки (см):")
 
-    elif state["step"] == "height":
-        volume, total = calc_concrete(
-            state["length"], state["width"], value
-        )
+        elif state["step"] == "thickness":
+            v, t = calc_screed(state["area"], value)
+            await msg.answer(
+                f"🧱 Стяжка пола:\n\n"
+                f"Объём: {v} м³\n"
+                f"С запасом: {t} м³\n\n"
+                f"⚠️ Расчёт ориентировочный.",
+                reply_markup=back_to_menu()
+            )
+            user_state.pop(uid)
 
-        await msg.answer(
-            f"🧱 Расчёт бетона:\n\n"
-            f"Объём: {volume} м³\n"
-            f"С запасом (10%): {total} м³\n\n"
-            f"Рекомендуется заказывать не меньше {round(total + 0.5)} м³.\n\n"
-            f"⚠️ Расчёт ориентировочный."
-        )
+    # ===== ШТУКАТУРКА =====
+    elif material == "plaster":
+        if state["step"] == "area":
+            state["area"] = value
+            state["step"] = "thickness"
+            await msg.answer("Введите среднюю толщину слоя (мм):")
 
-        user_state.pop(uid)
+        elif state["step"] == "thickness":
+            v, t = calc_plaster(state["area"], value)
+            await msg.answer(
+                f"🧱 Штукатурка стен:\n\n"
+                f"Объём: {v} м³\n"
+                f"С запасом: {t} м³\n\n"
+                f"⚠️ Расчёт ориентировочный.",
+                reply_markup=back_to_menu()
+            )
+            user_state.pop(uid)
 
+    # ===== ПЛИТКА =====
+    elif material == "tile":
+        if state["step"] == "area":
+            state["area"] = value
+            state["step"] = "a"
+            await msg.answer("Введите сторону плитки A (см):")
 
-@router.callback_query(F.data == "price")
-async def price(cb: CallbackQuery):
-    user_state[cb.from_user.id] = {"step": "price_area"}
-    await cb.message.answer("Введите площадь (м²):")
-    await cb.answer()
+        elif state["step"] == "a":
+            state["a"] = value
+            state["step"] = "b"
+            await msg.answer("Введите сторону плитки B (см):")
 
-
-@router.message()
-async def price_handler(msg: Message):
-    uid = msg.from_user.id
-    if uid not in user_state:
-        return
-
-    state = user_state[uid]
-
-    if state.get("step") == "price_area":
-        try:
-            area = float(msg.text.replace(",", "."))
-        except:
-            await msg.answer("Введите число.")
-            return
-
-        min_p, max_p = calc_price("stjazhka", area, "standard")
-
-        await msg.answer(
-            f"💰 Ориентировочная стоимость стяжки пола:\n\n"
-            f"От {min_p:,} до {max_p:,} ₽\n\n"
-            f"Цена зависит от толщины слоя и основания.\n"
-            f"⚠️ Не является сметой."
-        )
-
-        user_state.pop(uid)
+        elif state["step"] == "b":
+            count, total = calc_tile(state["area"], state["a"], value)
+            await msg.answer(
+                f"🧱 Плитка:\n\n"
+                f"Необходимое количество: {count} шт\n"
+                f"С запасом: {total} шт\n\n"
+                f"⚠️ Рекомендуется брать с запасом.",
+                reply_markup=back_to_menu()
+            )
+            user_state.pop(uid)
