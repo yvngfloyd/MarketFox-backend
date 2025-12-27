@@ -1,5 +1,6 @@
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+
 def main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🧱 Рассчитать материалы", callback_data="materials")],
@@ -7,13 +8,17 @@ def main_menu():
     ])
 
 
-def materials_menu():
+def back_to_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Бетон", callback_data="mat_concrete")]
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_menu")]
     ])
 
 
-def price_menu():
+def materials_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Стяжка пола", callback_data="price_stjazhka")]
+        [InlineKeyboardButton(text="Бетон", callback_data="mat_concrete")],
+        [InlineKeyboardButton(text="Стяжка пола", callback_data="mat_screed")],
+        [InlineKeyboardButton(text="Штукатурка стен", callback_data="mat_plaster")],
+        [InlineKeyboardButton(text="Плитка", callback_data="mat_tile")],
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_menu")]
     ])
