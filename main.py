@@ -1,17 +1,18 @@
-from fastapi import FastAPI, Request
+# main.py
+from fastapi import FastAPI
 from bot import bot, dp
-from config import WEBHOOK_URL
+import os
+from aiogram.types import Update
 
 app = FastAPI()
 
+
 @app.on_event("startup")
-async def startup():
-    await bot.delete_webhook(drop_pending_updates=True)
-    await bot.set_webhook(WEBHOOK_URL)
+async def on_startup():
+    await bot.set_webhook(os.getenv("WEBHOOK_URL"))
 
 
 @app.post("/webhook")
-async def webhook(req: Request):
-    data = await req.json()
-    await dp.feed_raw_update(bot, data)
+async def webhook(update: dict):
+    await dp.feed_update(bot, Update(**update))
     return {"ok": True}
